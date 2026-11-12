@@ -1372,6 +1372,27 @@ DEVINST EjectTargetNode(const UsbDisk& disk, std::wstring& target_id) {
     return node;
 }
 
+// --- 9.1. Запрос на извлечение с одним повтором -----------------------------
+// CM_Request_Device_Eject отправляет запрос IRP_MN_EJECT всей цепочке
+// устройств узла. Отказ PNP_VetoPendingClose («не завершена операция
+// закрытия») обычно означает, что файл только что закрыли и система ещё
+// доигрывает закрытие: через 250 мс тот же запрос проходит. Поэтому таких
+// отказов делаем до трёх попыток — пользователю не надо нажимать кнопку снова.
+CONFIGRET RequestEject(DEVINST node, PNP_VETO_TYPE& veto, std::wstring& veto_name,
+                       DWORD& api_error) {
+    CONFIGRET cr = CR_SUCCESS;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        wchar_t name[MAX_PATH] = {};
+        SetLastError(ERROR_SUCCESS);
+        cr = CM_Request_Device_EjectW(node, &veto, name, (ULONG)std::size(name), 0);
+        api_error = GetLastError();
+        veto_name = Trim(name);
+        if (cr == CR_SUCCESS || veto != PNP_VetoPendingClose) return cr;
+        Sleep(250);
+    }
+    return cr;
+}
+
 // --- 9.1. Проверка «устройство исчезло» -------------------------------------
 // После успешного извлечения узел может ещё существовать несколько сотен
 // миллисекунд, а может исчезнуть сразу. Проверяем именно Instance ID.
@@ -1551,15 +1572,38 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
 
     // 2. Запрос на извлечение.
     PNP_VETO_TYPE veto = PNP_VetoTypeUnknown;
-    wchar_t veto_name[MAX_PATH] = {};
-    const CONFIGRET cr = CM_Request_Device_EjectW(target, &veto, veto_name,
-                                                  (ULONG)std::size(veto_name), 0);
-    const DWORD api_error = GetLastError();
+    std::wstring veto_name;
+    DWORD api_error = 0;
+    CONFIGRET cr = RequestEject(target, veto, veto_name, api_error);
+
+    // Если узел USB-устройства помечен как неотключаемый, запрос отклоняется
+    // даже с правами администратора. Второй адресат — сам узел накопителя
+    // (USBSTOR\DISK...): он помечен съёмным, и тот же вызов для него
+    // проходит. Это не резервный «обходной» способ, а тот же
+    // CM_Request_Device_Eject, только для другого узла дерева.
+    if (cr != CR_SUCCESS && target_id != disk.instance_id) {
+        DEVINST self = 0;
+        if (CM_Locate_DevNodeW(&self, const_cast<DEVINSTID_W>(disk.instance_id.c_str()),
+                               CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
+            PNP_VETO_TYPE self_veto = PNP_VetoTypeUnknown;
+            std::wstring self_name;
+            DWORD self_error = 0;
+            const CONFIGRET self_cr = RequestEject(self, self_veto, self_name, self_error);
+            if (self_cr == CR_SUCCESS) {
+                cr = self_cr;
+                veto = self_veto;
+                veto_name = self_name;
+                api_error = self_error;
+                target_id = disk.instance_id;
+            }
+        }
+    }
 
     result.cr = cr;
     result.veto = veto;
-    result.veto_name = Trim(veto_name);
+    result.veto_name = veto_name;
     result.last_error = api_error;
+    result.target_id = target_id;
 
     bool gone = false;
     if (cr == CR_SUCCESS) {
