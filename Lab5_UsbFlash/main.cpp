@@ -1275,9 +1275,10 @@ std::vector<std::wstring> VetoAdvice(PNP_VETO_TYPE veto) {
 // заблокировать том (FSCTL_LOCK_VOLUME), размонтирование (FSCTL_DISMOUNT_VOLUME)
 // и снятие запрета на извлечение носителя (IOCTL_STORAGE_MEDIA_REMOVAL).
 //
-// Дескрипторы закрываются ДО запроса на извлечение: собственный открытый том
-// система считает «незавершённым обращением» и отклоняет запрос с
-// CR_REMOVE_VETOED — то есть виноватым оказалось бы само приложение.
+// Дескрипторы остаются открытыми до конца запроса на извлечение: блокировка
+// тома живёт, пока открыт дескриптор, и закрытие раньше времени возвращает
+// том в строй — тогда кто угодно снова его откроет, а запрос получит
+// CR_REMOVE_VETOED.
 //
 // Деструктор закрывает все handles: исключение или ранний выход не оставят
 // висящих дескрипторов.
@@ -1420,12 +1421,10 @@ DEVINST EjectTargetNode(const UsbDisk& disk, std::wstring& target_id) {
     return node;
 }
 
-// --- 9.1. Запрос на извлечение с одним повтором -----------------------------
-// CM_Request_Device_Eject отправляет запрос IRP_MN_EJECT всей цепочке
-// устройств узла. Отказ PNP_VetoPendingClose («не завершена операция
-// закрытия») обычно означает, что файл только что закрыли и система ещё
-// доигрывает закрытие: через 250 мс тот же запрос проходит. Поэтому таких
-// отказов делаем до трёх попыток — пользователю не надо нажимать кнопку снова.
+// --- 9.1. Запрос на извлечение ----------------------------------------------
+// Запрос к PnP проходит не с первой попытки: том мог быть только что
+// размонтирован, а система ещё доигрывает завершение операций. Поэтому
+// повторяем до трёх раз с паузой 250 мс, как это делает и Проводник.
 CONFIGRET RequestEject(DEVINST node, PNP_VETO_TYPE& veto, std::wstring& veto_name,
                        DWORD& api_error) {
     CONFIGRET cr = CR_SUCCESS;
@@ -1435,7 +1434,7 @@ CONFIGRET RequestEject(DEVINST node, PNP_VETO_TYPE& veto, std::wstring& veto_nam
         cr = CM_Request_Device_EjectW(node, &veto, name, (ULONG)std::size(name), 0);
         api_error = GetLastError();
         veto_name = Trim(name);
-        if (cr == CR_SUCCESS || veto != PNP_VetoPendingClose) return cr;
+        if (cr == CR_SUCCESS) break;
         Sleep(250);
     }
     return cr;
@@ -1629,10 +1628,10 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
     }
 
     // 1. Подготовка томов: кэши и размонтирование (для MTP томов нет).
+    //    Тома остаются заблокированными до конца запроса: блокировка снимается
+    //    при закрытии дескриптора, и если закрыть его раньше, файловая система
+    //    успевает смонтировать том обратно, а извлечение отклоняется.
     EjectPrep prep = PrepareVolumesForEject(disk);
-    // Своих открытых томов в момент запроса быть не должно: открытый нами том
-    // система считает незавершённым обращением и отвечает CR_REMOVE_VETOED.
-    prep.CloseAll();
 
     // 2. Запрос на извлечение.
     PNP_VETO_TYPE veto = PNP_VetoTypeUnknown;
@@ -1682,6 +1681,7 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
                             : std::vector<std::wstring>{
                                   L"Данные на носителе сброшены — отключать можно и так."};
         disk.eject_note = L"CM_Request_Device_Eject: CR_SUCCESS";
+        prep.CloseAll();
         return result;
     }
 
