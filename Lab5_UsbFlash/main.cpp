@@ -2611,6 +2611,10 @@ private:
         text += L"Платформа: Windows, SetupAPI + CfgMgr32 + IOCTL\r\n";
         text += L"Отчёт сформирован: " + NowStamp(false) + L"\r\n";
         text += L"Права процесса: " + std::wstring(elevated_ ? L"администратор" : L"обычные") + L"\r\n";
+        text += L"Привилегии:       " +
+                std::wstring(privileges_ready_ ? L"SeLoadDriver/SeUndock включены"
+                                               : L"SeLoadDriver/SeUndock недоступны") +
+                L"\r\n";
         text += std::wstring(78, L'=') + L"\r\n\r\n";
 
         text += Format(L"Найдено устройств: %d\r\n\r\n", (int)disks_.size());
