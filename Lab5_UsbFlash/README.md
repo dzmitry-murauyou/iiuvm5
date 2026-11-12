@@ -1,0 +1,223 @@
+# Лабораторная работа №5 — программирование шины USB
+
+**Вариант А1 (вариант 1 методички): USB Flash / Mass Storage на Windows,
+SetupAPI + IOCTL.**
+
+Проект Visual Studio (`Lab5_UsbFlash/`), язык C++17, Win32 API + GDI+,
+оформление и архитектура — как в лабораторной работе №4 (`Lab4_Camera/`).
+
+---
+
+## 1. Что делает программа
+
+| Пункт задания | Где в коде | Что видно в интерфейсе |
+|---|---|---|
+| 1. Перечисление USB-накопителей через SetupAPI (`GUID_DEVINTERFACE_DISK`, `GUID_DEVINTERFACE_USB_DEVICE`) | `ScanUsbDisks()`, `EnumerateUsbDevicesReport()` | список слева, статистика в шапке |
+| 2. VID, PID, серийный номер, производитель, модель, объём | `ParseUsbStorId()`, `QueryPortInfo()`, `DiskCapacity()` | карточка «Устройство» |
+| 3. Буквы логических дисков | `VolumesByDiskNumber()`, `VolumeOfLetter()` | строки «Буквы дисков», «Том E:» |
+| 4. Безопасное извлечение через `CM_Request_Device_Eject` | `EjectDisk()`, `PrepareVolumesForEject()` | кнопка «Безопасное извлечение», Ctrl+E |
+| 5. Причина отказа (veto) | `VetoText()`, `VetoAdvice()`, `ConfigRetText()` | журнал + всплывающая плашка |
+
+Дополнительно:
+
+* горячее подключение — `WM_DEVICECHANGE` (`DBT_DEVICEARRIVAL`,
+  `DBT_DEVICEREMOVECOMPLETE`, `DBT_DEVNODES_CHANGED`) с подпиской на
+  `GUID_DEVINTERFACE_VOLUME` и `GUID_DEVINTERFACE_USB_DEVICE`;
+* скорость соединения и дескриптор устройства — IOCTL драйвера хаба
+  `IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX`;
+* журнал событий в окне и файле `usb_log.txt`, отчёт `usb_report_*.txt`
+  со всеми сведениями и полным списком USB-устройств.
+
+## 2. Сборка
+
+### Visual Studio 2026 (или 2022)
+
+1. Открыть `Lab5_UsbFlash.slnx` (или `Lab5_UsbFlash.sln`).
+2. Платформа **x64**, конфигурация **Debug** или **Release**.
+3. `Ctrl+Shift+B` — сборка, `F5` — запуск.
+
+Внешних зависимостей нет: только Windows SDK (`setupapi.h`, `cfgmgr32.h`,
+`winioctl.h`, `usbioctl.h`) и GDI+.
+
+Подключённые библиотеки (`Lab5_UsbFlash.vcxproj`):
+
+```
+setupapi.lib  cfgmgr32.lib  comctl32.lib  shell32.lib  user32.lib
+gdi32.lib     advapi32.lib  ole32.lib     uuid.lib
+```
+
+Набор инструментов — `v145` (VS 2026). Для VS 2022 поменяйте
+`<PlatformToolset>v145</PlatformToolset>` на `v143` в двух местах `.vcxproj`.
+
+### Запуск
+
+* Обычные права: перечисление, идентификация, отчёт, журнал — работают;
+  безопасное извлечение может вернуть `CR_ACCESS_DENIED` /
+  `PNP_VetoInsufficientRights` (это штатно обрабатывается и объясняется).
+* **Права администратора** (правый клик по `Lab5_UsbFlash.exe` →
+  «Запуск от имени администратора») — полный доступ к IOCTL и извлечению.
+  Текущие права показаны меткой в правом верхнем углу окна.
+
+## 3. Файлы проекта
+
+```
+Lab5_UsbFlash/
+├── main.cpp                 логика: SetupAPI, CfgMgr32, IOCTL, тома, извлечение
+├── visual.h / visual.cpp    оформление: тёмная тема GDI+, карточки, owner-draw
+├── app.rc                   значок и сведения о версии
+├── app.ico
+└── Lab5_UsbFlash.vcxproj    проект VS 2026 (x64, C++17, Unicode)
+Lab5_UsbFlash.slnx / .sln    решение
+```
+
+Разделение то же, что в ЛР №4: `main.cpp` знает про USB и ничего не знает
+про рисование, `visual.cpp` рисует присланную `visual::Model` и ничего не
+знает про USB.
+
+## 4. Как это работает (по шагам)
+
+### 4.1. Перечисление (SetupAPI)
+
+```cpp
+HDEVINFO set = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_DISK, nullptr, nullptr,
+                                    DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+for (DWORD i = 0; SetupDiEnumDeviceInterfaces(set, nullptr, &GUID_DEVINTERFACE_DISK, i, &id); ++i)
+{
+    SetupDiGetDeviceInterfaceDetailW(...);        // \\?\usbstor#disk&ven_...
+    SetupDiGetDeviceInstanceIdW(...);             // USBSTOR\DISK&VEN_...\4C530...
+    SetupDiGetDeviceRegistryPropertyW(...);       // SPDRP_FRIENDLYNAME / MFG / ...
+}
+SetupDiDestroyDeviceInfoList(set);
+```
+
+Остаются только интерфейсы, в пути которых есть `usbstor` — это и есть
+USB-накопители (SATA/NVMe-диски отбрасываются).
+
+### 4.2. Идентификаторы
+
+* `VID`/`PID` и `bcdDevice` — из USB-дескриптора устройства, который отдаёт
+  драйвер хаба по `IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX`;
+* производитель и модель — из `Instance ID`
+  (`VEN_SANDISK&PROD_ULTRA&REV_1.00`) и свойств узла
+  (`SPDRP_MFG`, `DEVPKEY_Device_Manufacturer`);
+* серийный номер — хвост `Instance ID`, при отсутствии —
+  `IOCTL_STORAGE_QUERY_PROPERTY` (`SerialNumberOffset`);
+* объём — `IOCTL_DISK_GET_LENGTH_INFO`, запасной вариант
+  `IOCTL_STORAGE_READ_CAPACITY`;
+* версия шины — `bcdUSB` (0x0200 → USB 2.0, 0x0300 → USB 3.0), скорость —
+  поле `Speed` того же IOCTL.
+
+### 4.3. Буквы дисков
+
+Диск и том в Windows — разные объекты, поэтому буквы ищутся так:
+
+1. для каждой буквы `A:`…`Z:` открывается `\\.\X:` и запрашивается
+   `IOCTL_STORAGE_GET_DEVICE_NUMBER` → номер физического диска;
+2. тот же IOCTL для `\\?\usbstor#...` даёт номер диска накопителя;
+3. совпадение номеров = «этот том принадлежит этому накопителю»;
+4. `GetVolumeInformationW` / `GetDiskFreeSpaceExW` добавляют метку, ФС,
+   полный и свободный объём, `GetWindowsDirectoryW` — признак системного тома.
+
+### 4.4. Безопасное извлечение
+
+```cpp
+// 1. подготовка томов
+FlushFileBuffers(hVolume);                  // сброс кэшей ФС
+DeviceIoControl(hVolume, FSCTL_LOCK_VOLUME, ...);
+DeviceIoControl(hVolume, FSCTL_DISMOUNT_VOLUME, ...);
+
+// 2. запрос на извлечение
+PNP_VETO_TYPE veto = PNP_VetoTypeUnknown;
+wchar_t vetoName[MAX_PATH] = {};
+CONFIGRET cr = CM_Request_Device_EjectW(node, &veto, vetoName,
+                                        (ULONG)std::size(vetoName), 0);
+```
+
+Извлекается узел самого USB-устройства (`USB\VID_xxxx&PID_xxxx\...`), а не
+дочерний `USBSTOR\DISK&...`: именно он снимает питание с порта, как это
+делает Проводник.
+
+Разбор отказа:
+
+| Что вернула система | Что сообщает программа |
+|---|---|
+| `CR_SUCCESS` | «Накопитель извлечён — можно отключать» |
+| `CR_REMOVE_VETOED` + `PNP_VetoOutstandingOpen` | «есть открытые файлы или каталоги» + совет закрыть их |
+| `PNP_VetoWindowsApp` / `PNP_VetoWindowsService` | называет процесс/службу из `vetoName` |
+| `PNP_VetoInsufficientRights` | «запустите программу от имени администратора» |
+| `PNP_VetoInsufficientPower` | совет сменить порт/хаб с питанием |
+| `PNP_VetoNonDisableable`, `PNP_VetoLegacyDriver` | «драйвер не поддерживает извлечение» |
+| системный том | отказ ещё до запроса, с объяснением |
+
+## 5. Сценарий проверки на стенде
+
+1. Запустить программу без флешки — список пуст, подсказка «Подключите флешку».
+2. Вставить USB-накопитель — появляется строка (без нажатия кнопок), в
+   журнале `DBT_DEVICEARRIVAL`.
+3. Выбрать накопитель — справа VID/PID/серийник/производитель/модель/объём,
+   буквы дисков и параметры томов.
+4. Открыть на флешке файл (например, в Блокноте) и нажать
+   «Безопасное извлечение» — программа покажет `CR_REMOVE_VETOED` и
+   `PNP_VetoOutstandingOpen` с рекомендацией.
+5. Закрыть файл, повторить — «Накопитель извлечён», строка исчезает из списка.
+6. «Сохранить отчёт» — в `Документы\UsbLab5` появится `usb_report_*.txt`.
+
+## 6. Ответы на контрольные вопросы (кратко)
+
+1. **Топология USB** — многоуровневая звезда: корневой хаб в хост-контроллере,
+   к нему через внешние хабы подключаются устройства; до 7 уровней, до 127
+   адресов. Корневой хаб опрашивает порты и создаёт устройства, внешний —
+   повторяет это для своих портов и усиливает сигнал.
+2. **Иерархия дескрипторов**: Device (18 байт, `idVendor`, `idProduct`,
+   `bNumConfigurations`) → Configuration (`wTotalLength`, `bNumInterfaces`) →
+   Interface (`bInterfaceClass`, `bNumEndpoints`) → Endpoint
+   (`bEndpointAddress`, `bmAttributes`, `wMaxPacketSize`). Строковые дескрипторы
+   адресуются индексами `iManufacturer`, `iProduct`, `iSerialNumber`.
+3. **Строковые дескрипторы** (`libusb_get_string_descriptor_ascii`) требуют
+   `libusb_open`, потому что это control-транзакция к конкретному устройству
+   (bmRequestType 0x80, bRequest GET_DESCRIPTOR, индекс строки). Дескриптор
+   устройства читается и без открытия, а строки — уже обмен с устройством.
+4. **Безопасное vs небезопасное извлечение**: безопасное сбрасывает кэши ФС
+   (`FlushFileBuffers`), размонтирует том, останавливает устройство и снимает
+   питание — данные гарантированно на носителе. Небезопасное выдёргивание
+   оставляет «грязные» страницы кэша: возможны потеря записанного и
+   повреждение ФС.
+5. **Обнаружение подключения в Windows**: `WM_DEVICECHANGE` с
+   `DBT_DEVICEARRIVAL` / `DBT_DEVICEREMOVECOMPLETE` /
+   `DBT_DEVNODES_CHANGED`; чтобы получать события по конкретному классу,
+   нужно `RegisterDeviceNotification` с GUID интерфейса. Дополнительно —
+   `CM_Register_Notification` и WMI-события.
+6. **Составное устройство (composite)** — одна Configuration с несколькими
+   Interface (например, гарнитура: Audio + HID). Обрабатывать нужно по
+   интерфейсам: каждый получает свой драйвер (или IAD-группу). Compound —
+   другое: несколько независимых устройств за внутренним хабом.
+7. **Тома накопителя**: в Windows — `IOCTL_STORAGE_GET_DEVICE_NUMBER` для
+   диска и для каждого тома (`\\.\X:`), совпадение `DeviceNumber`;
+   в Linux — `/sys/bus/usb/devices/*/host*/target*` → `block/sdX`,
+   `lsblk`, `udevadm info`.
+8. **Причины отказа извлечения**: открытые файлы/каталоги, работающие
+   программы и службы (антивирус, индексирование), недостаточные права,
+   драйвер без поддержки `IRP_MN_EJECT`, занятый интерфейс составного
+   устройства, недостаточное питание порта, системный/загрузочный том.
+   Диагностика — код `CONFIGRET` + `PNP_VETO_TYPE` + имя veto-объекта
+   (именно это и выводит программа).
+9. **USB 2.0 (EHCI) vs USB 3.x (xHCI)**: EHCI — 480 Мбит/с, одна
+   полудуплексная пара D+/D−, отдельный контроллер и драйвер; xHCI — до
+   20 Гбит/с, дополнительные линии SSTX/SSRX (полный дуплекс), один
+   контроллер обслуживает устройства всех скоростей, управление портами и
+   питанием (U-state, Link Power Management).
+10. **QEMU**: проброс реального устройства — `-device usb-host,vendorid=0x0781,productid=0x5567`
+    (Linux, нужен доступ к usbfs) или `-device usb-host,hostbus=1,hostaddr=4`;
+    для Windows-гостя пробрасывается через USB 2.0/3.0 контроллер QEMU
+    (`-device qemu-xhci -device usb-host,...`), после чего устройство видно
+    в госте как обычная флешка.
+
+## 7. Отличия от ЛР №4
+
+| | ЛР №4 | ЛР №5 (этот проект) |
+|---|---|---|
+| Предмет | веб-камера (DirectShow, OpenCV) | USB-накопители (SetupAPI, CfgMgr32, IOCTL) |
+| Основные операции | снимок, запись, трей | идентификация, тома, безопасное извлечение |
+| Внешние зависимости | OpenCV | нет, только Windows SDK |
+| Оформление | тёмная тема, карточки, owner-draw | то же самое |
+| Архитектура | `main.cpp` + `visual.cpp` через `Model` | то же самое |
