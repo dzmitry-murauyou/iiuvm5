@@ -1679,11 +1679,11 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
     DWORD api_error = 0;
     CONFIGRET cr = RequestEject(target, veto, veto_name, api_error);
 
-    // Если узел USB-устройства помечен как неотключаемый, запрос отклоняется
-    // даже с правами администратора. Второй адресат — сам узел накопителя
-    // (USBSTOR\DISK...): он помечен съёмным, и тот же вызов для него
-    // проходит. Это не резервный «обходной» способ, а тот же
-    // CM_Request_Device_Eject, только для другого узла дерева.
+    // Если запрос к узлу USB-устройства отклонён (например, узел помечен
+    // неотключаемым), повторяем тот же CM_Request_Device_Eject для второго
+    // узла цепочки — самого накопителя (USBSTOR\DISK...). Он помечен
+    // съёмным, и запрос для него обычно проходит. Способ тот же, отличается
+    // только адресат запроса.
     if (cr != CR_SUCCESS && target_id != disk.instance_id) {
         DEVINST self = 0;
         if (CM_Locate_DevNodeW(&self, const_cast<DEVINSTID_W>(disk.instance_id.c_str()),
