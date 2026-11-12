@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Решение для Visual Studio 2026 (и 2022): открыть Lab5_UsbFlash.slnx
+  либо сам проект Lab5_UsbFlash/Lab5_UsbFlash.vcxproj.
+-->
+<Solution>
+  <Project Path="Lab5_UsbFlash/Lab5_UsbFlash.vcxproj" />
+</Solution>

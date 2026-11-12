@@ -1,0 +1,13 @@
+# Сборка Visual Studio
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.log
+
+# Отчёты и журналы, которые программа создаёт рядом с exe
+UsbLab5/
+reports/
