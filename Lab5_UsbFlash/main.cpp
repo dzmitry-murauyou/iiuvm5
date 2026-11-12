@@ -1402,6 +1402,17 @@ void RemountVolumes(const std::vector<wchar_t>& letters) {
 // Проводник. Если родитель не найден (например, диск подключён через
 // сторонний драйвер) — извлекаем сам узел USBSTOR.
 DEVINST EjectTargetNode(const UsbDisk& disk, std::wstring& target_id) {
+    // Телефон (MTP/PTP): сам узел — программное устройство WPD, извлекать
+    // нужно физический USB-узел, который мы нашли при перечислении.
+    if (disk.kind == UsbDisk::Kind::Portable && !disk.usb_node_id.empty()) {
+        DEVINST usb_node = 0;
+        if (CM_Locate_DevNodeW(&usb_node, const_cast<DEVINSTID_W>(disk.usb_node_id.c_str()),
+                               CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
+            target_id = disk.usb_node_id;
+            return usb_node;
+        }
+    }
+
     DEVINST node = 0;
     if (CM_Locate_DevNodeW(&node, const_cast<DEVINSTID_W>(disk.instance_id.c_str()),
                            CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) {
