@@ -1269,13 +1269,51 @@ std::vector<std::wstring> VetoAdvice(PNP_VETO_TYPE veto) {
     }
 }
 
-// Сбрасываем кэши и размонтируем тома — то же, что делает Проводник перед
-// извлечением. Без этого CM_Request_Device_Eject часто возвращает Veto.
-// Возвращает буквы томов, которые удалось размонтировать: только их нужно
-// монтировать обратно, если извлечение не состоялось.
-std::vector<wchar_t> PrepareVolumesForEject(const UsbDisk& disk,
-                                            std::vector<std::wstring>& notes) {
-    std::vector<wchar_t> dismounted;
+// Подготовка томов к извлечению: сброс кэшей, блокировка, размонтирование.
+//
+// Порядок и удержание блокировки взяты из того, что делает Проводник:
+// том блокируется (FSCTL_LOCK_VOLUME) и остаётся открытым до конца запроса
+// на извлечение. Если закрыть handle до запроса, антивирус или индексатор
+// успевают снова открыть том — и система отвечает CR_REMOVE_VETOED, даже
+// когда программа запущена от администратора.
+//
+// Деструктор закрывает все handles: исключение или ранний выход не оставят
+// висящих дескрипторов.
+struct EjectPrep {
+    std::vector<wchar_t> dismounted;   // буквы размонтированных томов
+    std::vector<HANDLE> handles;       // открытые (заблокированные) тома
+    std::vector<std::wstring> notes;   // что не получилось — в журнал
+
+    EjectPrep() = default;
+    EjectPrep(const EjectPrep&) = delete;             // handles нельзя копировать
+    EjectPrep& operator=(const EjectPrep&) = delete;
+    EjectPrep(EjectPrep&& other) noexcept { Swap(other); }
+    EjectPrep& operator=(EjectPrep&& other) noexcept {
+        if (this != &other) {
+            CloseAll();
+            Swap(other);
+        }
+        return *this;
+    }
+    ~EjectPrep() { CloseAll(); }
+
+    void Swap(EjectPrep& other) noexcept {
+        dismounted.swap(other.dismounted);
+        handles.swap(other.handles);
+        notes.swap(other.notes);
+    }
+
+    void CloseAll() {
+        for (HANDLE handle : handles) {
+            if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+        }
+        handles.clear();
+    }
+};
+
+EjectPrep PrepareVolumesForEject(const UsbDisk& disk) {
+    EjectPrep prep;
+
     for (const VolumeInfo& volume : disk.volumes) {
         wchar_t volume_path[] = {L'\\', L'\\', L'?', L'\\', volume.letter, L':', 0};
 
@@ -1291,35 +1329,43 @@ std::vector<wchar_t> PrepareVolumesForEject(const UsbDisk& disk,
             raw = CreateFileW(volume_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                               nullptr, OPEN_EXISTING, 0, nullptr);
         }
-        Handle volume_handle(raw);
-        if (!volume_handle) {
-            notes.push_back(Format(L"Том %c: не открылся для сброса кэша (ошибка %lu)",
-                                   volume.letter, GetLastError()));
+        if (raw == INVALID_HANDLE_VALUE) {
+            prep.notes.push_back(Format(L"Том %c: не открылся для сброса кэша (ошибка %lu)",
+                                        volume.letter, GetLastError()));
             continue;
         }
 
         DWORD returned = 0;
-        FlushFileBuffers(volume_handle.get());
+        FlushFileBuffers(raw);
 
-        // 2. Блокируем и размонтируем том, чтобы никто не писал в процессе.
-        if (DeviceIoControl(volume_handle.get(), FSCTL_LOCK_VOLUME, nullptr, 0, nullptr, 0,
-                            &returned, nullptr)) {
-            if (DeviceIoControl(volume_handle.get(), FSCTL_DISMOUNT_VOLUME, nullptr, 0, nullptr, 0,
-                                &returned, nullptr)) {
-                dismounted.push_back(volume.letter);
-            }
-        } else {
-            notes.push_back(Format(L"Том %c: занят, блокировка не удалась (ошибка %lu)",
-                                   volume.letter, GetLastError()));
+        // 2. Блокируем том: до конца запроса никто не должен в него писать.
+        //    Блокировка может не удаться сразу — файл только что закрыли,
+        //    антивирус ещё держит том. Поэтому несколько попыток.
+        bool locked = false;
+        for (int attempt = 0; attempt < 5 && !locked; ++attempt) {
+            locked = DeviceIoControl(raw, FSCTL_LOCK_VOLUME, nullptr, 0, nullptr, 0, &returned,
+                                     nullptr) != FALSE;
+            if (!locked) Sleep(120);
+        }
+        if (!locked) {
+            prep.notes.push_back(Format(L"Том %c: занят, блокировка не удалась (ошибка %lu)",
+                                        volume.letter, GetLastError()));
         }
 
-        // 3. Разрешаем извлечение носителя драйверу (снимаем «prevent»).
+        // 3. Размонтируем том, чтобы файловая система не обращалась к нему
+        //    во время извлечения, и разрешаем извлечение носителя.
+        if (DeviceIoControl(raw, FSCTL_DISMOUNT_VOLUME, nullptr, 0, nullptr, 0, &returned, nullptr)) {
+            prep.dismounted.push_back(volume.letter);
+        }
         PREVENT_MEDIA_REMOVAL prevent{};
         prevent.PreventMediaRemoval = FALSE;
-        DeviceIoControl(volume_handle.get(), IOCTL_STORAGE_MEDIA_REMOVAL, &prevent, sizeof(prevent),
-                        nullptr, 0, &returned, nullptr);
+        DeviceIoControl(raw, IOCTL_STORAGE_MEDIA_REMOVAL, &prevent, sizeof(prevent), nullptr, 0,
+                        &returned, nullptr);
+
+        // Handle держим открытым до конца извлечения — см. комментарий выше.
+        prep.handles.push_back(raw);
     }
-    return dismounted;
+    return prep;
 }
 
 // Обратное действие: монтируем тома, если извлечение не состоялось.
@@ -1581,8 +1627,9 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
     }
 
     // 1. Подготовка томов: кэши и размонтирование (для MTP томов нет).
-    std::vector<std::wstring> notes;
-    const std::vector<wchar_t> dismounted = PrepareVolumesForEject(disk, notes);
+    //    Тома остаются заблокированными до конца запроса — так же, как при
+    //    извлечении через Проводник.
+    EjectPrep prep = PrepareVolumesForEject(disk);
 
     // 2. Запрос на извлечение.
     PNP_VETO_TYPE veto = PNP_VetoTypeUnknown;
@@ -1635,10 +1682,12 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
         return result;
     }
 
-    // 3. Отказ: возвращаем тома в рабочее состояние и объясняем причину.
-    if (!dismounted.empty()) {
-        RemountVolumes(dismounted);
-        notes.push_back(L"Тома смонтированы обратно.");
+    // 3. Отказ: снимаем блокировку, возвращаем тома в рабочее состояние
+    //    и объясняем причину.
+    prep.CloseAll();
+    if (!prep.dismounted.empty()) {
+        RemountVolumes(prep.dismounted);
+        prep.notes.push_back(L"Тома смонтированы обратно.");
     }
 
     result.message = Format(L"Извлечение отклонено: %s", VetoText(veto).c_str());
@@ -1648,7 +1697,7 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
     if (!result.veto_name.empty()) {
         result.advice.push_back(Format(L"Держит устройство: %s", result.veto_name.c_str()));
     }
-    for (const std::wstring& note : notes) result.advice.push_back(note);
+    for (const std::wstring& note : prep.notes) result.advice.push_back(note);
 
     // Причина «неизвестна» — проверяем тома: открытые файлы дают veto.
     if (veto == PNP_VetoTypeUnknown && !disk.volumes.empty()) {
