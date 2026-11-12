@@ -3,16 +3,14 @@
 //
 //  Модуль ничего не знает об USB, SetupAPI и IOCTL: он получает готовую
 //  структуру visual::Model и рисует по ней окно. Вся логика — в main.cpp.
-//
-//  Оформление и приёмы раскладки те же, что в ЛР №4: тёмная тема GDI+,
-//  карточки со скруглением, «поток сверху вниз» внутри карточки с обрезкой
-//  по её границам (SetClip), поэтому элементы не наезжают друг на друга
-//  при любом размере окна и любом масштабе DPI.
 // ===========================================================================
 
 #include "visual.h"
 
 #include <commctrl.h>
+#include <uxtheme.h>
+
+#pragma comment(lib, "uxtheme.lib")
 
 #include <algorithm>
 #include <cmath>
@@ -24,7 +22,7 @@ namespace visual {
 using namespace Gdiplus;
 
 // ---------------------------------------------------------------------------
-//  Тема (как в ЛР №4): цвета и «дизайнерские» размеры в DIP
+//  Тема: цвета и «дизайнерские» размеры в DIP
 // ---------------------------------------------------------------------------
 namespace theme {
 
@@ -218,8 +216,19 @@ void View::RecreateFonts() {
 }
 
 HWND View::Make(const wchar_t* cls, const wchar_t* text, DWORD style, int id) {
-    return CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, parent_,
-                           (HMENU)(INT_PTR)id, inst_, nullptr);
+    // WS_EX_NOPARENTNOTIFY не нужен; для кнопок важен BS_OWNERDRAW + отсутствие
+    // темы: у themed-кнопки Windows сама рисует светлую рамку и углы, которые
+    // торчат из-под нашей скруглённой заливки.
+    HWND hwnd = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10,
+                                parent_, (HMENU)(INT_PTR)id, inst_, nullptr);
+    if (hwnd && _wcsicmp(cls, L"BUTTON") == 0) {
+        // Отключаем визуальные стили для этого контрола: рисуем его сами.
+        SetWindowTheme(hwnd, L"", L"");
+        // Плоская рамка вместо объёмной.
+        LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_CLIENTEDGE & ~WS_EX_STATICEDGE);
+    }
+    return hwnd;
 }
 
 void View::CreateControls() {
@@ -486,8 +495,7 @@ void View::DrawHeader(Graphics& g, const Model& model) {
     g.SetClip(RectF(0.0f, 0.0f, (REAL)std::max<LONG>(1, header_rc_.right), (REAL)S(theme::HeaderH)));
 
     TextG(g, L"USB-накопители", title_rc_, f_title_, theme::Txt);
-    TextG(g, L"SetupAPI · IOCTL · безопасное извлечение (ЛР №5, вариант А1)", subtitle_rc_,
-          f_label_, theme::Sub);
+    TextG(g, L"SetupAPI · IOCTL · безопасное извлечение", subtitle_rc_, f_label_, theme::Sub);
 
     // Слева направо: состояние поиска, затем права процесса.
     DrawPill(g, state_pill_, model.status.empty() ? L"Поиск устройств…" : model.status,
@@ -575,7 +583,7 @@ void View::DrawPanel(Graphics& g, const Model& model) {
     if (!model.has_device) {
         RECT rc{panel_rc_.left + S(theme::InnerPad), panel_rc_.top,
                 panel_rc_.right - S(theme::InnerPad), panel_rc_.bottom};
-        TextG(g, L"Выберите накопитель в списке слева", rc, f_label_, theme::Dim,
+        TextG(g, L"Выберите устройство в списке слева", rc, f_label_, theme::Dim,
               StringAlignmentCenter);
         g.ResetClip();
         return;
@@ -599,7 +607,7 @@ void View::DrawPanel(Graphics& g, const Model& model) {
         y += S(theme::RowH);
     }
 
-    TextG(g, L"Полные сведения — в отчёте (кнопка «Сохранить отчёт»)", hint_rc_, f_label_,
+    TextG(g, L"Полные сведения — в отчёте («Сохранить отчёт»)", hint_rc_, f_label_,
           theme::Dim);
 
     g.ResetClip();
@@ -732,7 +740,7 @@ void View::DrawButton(const DRAWITEMSTRUCT* item) {
         border = Color(255, 62, 76, 102);
         text = Color(255, 158, 170, 190);
     } else if (item->CtlID == ID_EJECT) {
-        // Опасная операция — красноватый акцент, как «стоп» в ЛР №4.
+        // Опасная операция — красноватый акцент.
         fill = pressed ? Color(255, 132, 44, 40) : Color(255, 106, 34, 32);
         border = Color(255, 214, 96, 88);
         text = Color(255, 255, 236, 234);
@@ -754,6 +762,11 @@ void View::DrawButton(const DRAWITEMSTRUCT* item) {
     }
 
     RECT rc = item->rcItem;
+
+    // Сначала закрашиваем весь прямоугольник под кнопкой: иначе в углах
+    // скругления остаётся системный светлый фон — они выглядят белыми
+    // «уголками». Цвет берём как у карточки: кнопки всегда лежат на ней.
+    FillRectG(g, rc, theme::Card);
     RoundedRect(g, rc, fill, border, RadiusPx());
 
     wchar_t buffer[128] = {};

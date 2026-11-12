@@ -1,7 +1,7 @@
 // ===========================================================================
-//  main.cpp — ЛР №5, вариант А1: «USB Flash (Mass Storage) на Windows»
+//  main.cpp — ЛР №5: USB-накопители (Mass Storage) на Windows
 //
-//  Задание (см. методичку, вариант 1):
+//  Задание:
 //    1. Перечислить USB-накопители через SetupAPI
 //       (GUID_DEVINTERFACE_DISK, GUID_DEVINTERFACE_USB_DEVICE).
 //    2. Для каждого вывести VID, PID, серийный номер, производителя,
@@ -12,16 +12,14 @@
 //    5. Обработать и вывести причину отказа (veto) при невозможности
 //       извлечения.
 //
-//  Дополнительно (как в ЛР №4, чтобы программа была «живой»):
-//    • горячее подключение через WM_DEVICECHANGE (DBT_DEVICEARRIVAL /
-//      DBT_DEVICEREMOVECOMPLETE + GUID_DEVINTERFACE_VOLUME);
-//    • скорость соединения из IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX
-//      (драйвер USB-хаба отдаёт скорость и дескриптор устройства);
+//  Дополнительно:
+//    • горячее подключение через WM_DEVICECHANGE;
+//    • телефоны и плееры в режиме MTP/PTP (у них нет буквы диска);
+//    • скорость соединения из IOCTL USB-хаба;
 //    • журнал событий в окне и в файле, отчёт со всеми сведениями.
 //
-//  Архитектура — как в ЛР №4: логика (этот файл) отделена от визуала
-//  (visual.cpp) структурой visual::Model; визуал ничего не знает про
-//  SetupAPI и IOCTL.
+//  Архитектура: логика (этот файл) отделена от визуала (visual.cpp)
+//  структурой visual::Model; визуал ничего не знает про SetupAPI и IOCTL.
 // ===========================================================================
 #include "visual.h"
 
@@ -245,6 +243,8 @@ struct UsbDisk {
     bool write_protected = false;
     bool system = false;             // среди томов есть системный
     bool present = true;             // устройство ещё подключено
+    bool no_access = false;          // путь устройства не открывается (отключено/занято)
+    DWORD access_error = 0;          // код ошибки при открытии
     std::vector<VolumeInfo> volumes;
 };
 
@@ -879,21 +879,25 @@ ScanResult ScanUsbDisks() {
         UsbDisk disk;
         disk.disk_path = path;
 
+        // Устройство может быть в системе, но недоступно для открытия:
+        // отключено в Диспетчере устройств, занято драйвером, нет прав.
+        // Такое устройство всё равно показываем в списке — иначе программа
+        // «не видит флешку», хотя Windows её видит.
         Handle device = OpenDevice(path);
-        if (!device) {
-            result.warnings.push_back(Format(L"Не удалось открыть «%s» (ошибка %lu)",
-                                             FileName(path).c_str(), GetLastError()));
-            continue;
-        }
+        const bool accessible = static_cast<bool>(device);
 
         disk.device_number = (DWORD)-1;
-        if (!DiskNumber(device.get(), disk.device_number)) {
-            result.warnings.push_back(
-                Format(L"IOCTL_STORAGE_GET_DEVICE_NUMBER: ошибка %lu", GetLastError()));
+        if (accessible) {
+            if (!DiskNumber(device.get(), disk.device_number)) {
+                result.warnings.push_back(
+                    Format(L"IOCTL_STORAGE_GET_DEVICE_NUMBER: ошибка %lu", GetLastError()));
+            }
+            disk.capacity = DiskCapacity(device.get(), disk.sector_size);
+            DiskFlags(device.get(), disk.removable, disk.write_protected);
+        } else {
+            disk.access_error = GetLastError();
+            disk.no_access = true;
         }
-
-        disk.capacity = DiskCapacity(device.get(), disk.sector_size);
-        DiskFlags(device.get(), disk.removable, disk.write_protected);
 
         // Instance ID и свойства устройства — через SetupAPI.
         SP_DEVINFO_DATA data = detail.data;
@@ -925,7 +929,7 @@ ScanResult ScanUsbDisks() {
                 disk.model = Trim(disk.model.substr(0, pos));
             }
         }
-        if (disk.serial.empty()) disk.serial = StorageSerial(device.get());
+        if (disk.serial.empty() && accessible) disk.serial = StorageSerial(device.get());
         if (disk.bus.empty()) disk.bus = L"USB";
 
         // Узел в дереве устройств нужен и для свойств, и для IOCTL хаба,
@@ -1267,7 +1271,11 @@ std::vector<std::wstring> VetoAdvice(PNP_VETO_TYPE veto) {
 
 // Сбрасываем кэши и размонтируем тома — то же, что делает Проводник перед
 // извлечением. Без этого CM_Request_Device_Eject часто возвращает Veto.
-void PrepareVolumesForEject(const UsbDisk& disk, std::vector<std::wstring>& notes) {
+// Возвращает буквы томов, которые удалось размонтировать: только их нужно
+// монтировать обратно, если извлечение не состоялось.
+std::vector<wchar_t> PrepareVolumesForEject(const UsbDisk& disk,
+                                            std::vector<std::wstring>& notes) {
+    std::vector<wchar_t> dismounted;
     for (const VolumeInfo& volume : disk.volumes) {
         wchar_t volume_path[] = {L'\\', L'\\', L'?', L'\\', volume.letter, L':', 0};
 
@@ -1287,8 +1295,10 @@ void PrepareVolumesForEject(const UsbDisk& disk, std::vector<std::wstring>& note
         // 2. Блокируем и размонтируем том, чтобы никто не писал в процессе.
         if (DeviceIoControl(volume_handle.get(), FSCTL_LOCK_VOLUME, nullptr, 0, nullptr, 0,
                             &returned, nullptr)) {
-            DeviceIoControl(volume_handle.get(), FSCTL_DISMOUNT_VOLUME, nullptr, 0, nullptr, 0,
-                            &returned, nullptr);
+            if (DeviceIoControl(volume_handle.get(), FSCTL_DISMOUNT_VOLUME, nullptr, 0, nullptr, 0,
+                                &returned, nullptr)) {
+                dismounted.push_back(volume.letter);
+            }
         } else {
             notes.push_back(Format(L"Том %c: занят, блокировка не удалась (ошибка %lu)",
                                    volume.letter, GetLastError()));
@@ -1299,6 +1309,25 @@ void PrepareVolumesForEject(const UsbDisk& disk, std::vector<std::wstring>& note
         prevent.PreventMediaRemoval = FALSE;
         DeviceIoControl(volume_handle.get(), IOCTL_STORAGE_MEDIA_REMOVAL, &prevent, sizeof(prevent),
                         nullptr, 0, &returned, nullptr);
+    }
+    return dismounted;
+}
+
+// Обратное действие: монтируем тома, если извлечение не состоялось.
+// Без этого после отказа Проводник показывал бы «пустой» диск, хотя данные
+// на месте: том остался размонтированным нашей же подготовкой.
+void RemountVolumes(const std::vector<wchar_t>& letters) {
+    for (wchar_t letter : letters) {
+        wchar_t path[] = {L'\\', L'\\', L'?', L'\\', letter, L':', 0};
+        Handle volume(CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+                                  nullptr));
+        if (!volume) continue;
+        DWORD returned = 0;
+        DeviceIoControl(volume.get(), FSCTL_LOCK_VOLUME, nullptr, 0, nullptr, 0, &returned,
+                        nullptr);
+        DeviceIoControl(volume.get(), FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &returned,
+                        nullptr);
     }
 }
 
@@ -1347,15 +1376,18 @@ bool WaitDeviceGone(const std::wstring& instance_id, int attempts = 6, DWORD del
     return !DeviceStillPresent(instance_id);
 }
 
-// --- 9.2. Отключение узла через SetupAPI (fallback) -------------------------
+// --- 9.2. Отключение узла через SetupAPI (только как резерв) ----------------
 //
-// CM_Request_Device_Eject может вернуть CR_REMOVE_VETOED или CR_FAILURE из-за
-// фильтр-драйверов (антивирус, «умное» ПО накопителя). В этом случае остаётся
-// штатный путь Диспетчера устройств: DIF_PROPERTYCHANGE + DICS_DISABLE —
-// это тоже программное отключение устройства, только без снятия питания.
-// Такой приём требует прав администратора, поэтому программа сначала
-// проверяет, что процесс повышен.
-bool DisableDeviceNode(const std::wstring& instance_id, DWORD& last_error) {
+// CM_Request_Device_Eject может вернуть отказ из-за фильтр-драйверов.
+// Резервный путь — штатное отключение узла, как в Диспетчере устройств:
+// DIF_PROPERTYCHANGE + DICS_DISABLE.
+//
+// ВАЖНО: DICS_DISABLE — это не извлечение, а отключение. Windows запоминает
+// выбор пользователя, и после переподключения устройство остаётся
+// отключённым: «компьютер видит, программа — нет», флешки нет в Проводнике.
+// Поэтому резерв применяется только по явному подтверждению и после него
+// сразу выполняется включение узла обратно (DICS_ENABLE).
+bool ChangeDeviceState(const std::wstring& instance_id, DWORD state, DWORD& last_error) {
     DeviceInfoSet set(SetupDiCreateDeviceInfoList(nullptr, nullptr));
     if (!set) {
         last_error = GetLastError();
@@ -1372,12 +1404,12 @@ bool DisableDeviceNode(const std::wstring& instance_id, DWORD& last_error) {
     SP_PROPCHANGE_PARAMS params{};
     params.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
     params.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
-    params.StateChange = DICS_DISABLE;
-    params.Scope = DICS_FLAG_GLOBAL;      // отключить для всей системы
+    params.StateChange = state;
+    params.Scope = DICS_FLAG_GLOBAL;      // для всей системы
     params.HwProfile = 0;
 
-    if (!SetupDiSetClassInstallParamsW(set.get(), &data,
-                                       &params.ClassInstallHeader, sizeof(params))) {
+    if (!SetupDiSetClassInstallParamsW(set.get(), &data, &params.ClassInstallHeader,
+                                       sizeof(params))) {
         last_error = GetLastError();
         return false;
     }
@@ -1389,6 +1421,83 @@ bool DisableDeviceNode(const std::wstring& instance_id, DWORD& last_error) {
     return true;
 }
 
+// Проверка «устройство вообще есть в системе» — по классу, а не по Instance ID.
+bool AnyMassStoragePresent() {
+    DeviceInfoSet set(SetupDiGetClassDevsW(&GUID_DEVINTERFACE_DISK, nullptr, nullptr,
+                                          DIGCF_PRESENT | DIGCF_DEVICEINTERFACE));
+    if (!set) return false;
+
+    SP_DEVICE_INTERFACE_DATA interface_data{};
+    interface_data.cbSize = sizeof(interface_data);
+    for (DWORD i = 0;
+         SetupDiEnumDeviceInterfaces(set.get(), nullptr, &GUID_DEVINTERFACE_DISK, i,
+                                     &interface_data);
+         ++i) {
+        InterfaceDetail detail = GetInterfaceDetail(set.get(), interface_data);
+        if (detail.valid && Uppercase(detail.path).find(L"USBSTOR") != std::wstring::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+ULONG NodeProblem(DEVINST node) {
+    ULONG status = 0, problem = 0;
+    if (CM_Get_DevNode_Status(&status, &problem, node, 0) != CR_SUCCESS) return 0;
+    return problem;
+}
+
+bool NodeDisabled(DEVINST node) {
+    ULONG status = 0, problem = 0;
+    if (CM_Get_DevNode_Status(&status, &problem, node, 0) != CR_SUCCESS) return false;
+    return problem == CM_PROB_DISABLED;
+}
+
+// Включаем все отключённые USB-накопители обратно (код 22).
+// Нужно после неудачного «резервного отключения» или если пользователь ранее
+// отключил устройство в Диспетчере устройств: Windows помнит это состояние,
+// и устройство не появляется ни в программе, ни в Проводнике.
+int EnableDisabledUsbDevices() {
+    int fixed = 0;
+    DeviceInfoSet set(SetupDiGetClassDevsW(&GUID_DEVCLASS_DISKDRIVE, L"USBSTOR", nullptr,
+                                          DIGCF_PRESENT | DIGCF_ALLCLASSES));
+    if (!set) return 0;
+
+    SP_DEVINFO_DATA data{};
+    data.cbSize = sizeof(data);
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(set.get(), i, &data); ++i) {
+        wchar_t id[MAX_DEVICE_ID_LEN] = {};
+        if (!SetupDiGetDeviceInstanceIdW(set.get(), &data, id, (DWORD)std::size(id), nullptr)) {
+            continue;
+        }
+        if (!NodeDisabled(data.DevInst)) continue;
+
+        DWORD error = 0;
+        if (ChangeDeviceState(id, DICS_ENABLE, error)) ++fixed;
+    }
+
+    // Сам USB-узел (USB\VID_...) тоже мог остаться отключённым.
+    DeviceInfoSet usb_set(SetupDiGetClassDevsW(&GUID_DEVCLASS_USB, nullptr, nullptr,
+                                               DIGCF_PRESENT));
+    if (usb_set) {
+        SP_DEVINFO_DATA usb_data{};
+        usb_data.cbSize = sizeof(usb_data);
+        for (DWORD i = 0; SetupDiEnumDeviceInfo(usb_set.get(), i, &usb_data); ++i) {
+            if (!NodeDisabled(usb_data.DevInst)) continue;
+            wchar_t id[MAX_DEVICE_ID_LEN] = {};
+            if (!SetupDiGetDeviceInstanceIdW(usb_set.get(), &usb_data, id, (DWORD)std::size(id),
+                                             nullptr)) {
+                continue;
+            }
+            DWORD error = 0;
+            if (ChangeDeviceState(id, DICS_ENABLE, error)) ++fixed;
+        }
+    }
+    return fixed;
+}
+
+// Отключён ли узел (CM_PROB_DISABLED = 22). Это и есть объяснение случая
+// «компьютер флешку видит, а программы — нет».
 // --- 9.3. Диагностика причины отказа ----------------------------------------
 // Когда CM_Request_Device_Eject вернул CR_REMOVE_VETOED с «неизвестной»
 // причиной, полезно проверить типичных «держателей»: тома на накопителе,
@@ -1426,13 +1535,22 @@ void DiagnoseVolumes(const UsbDisk& disk, std::vector<std::wstring>& advice) {
     }
 }
 
-// --- 9.4. Извлечение: полноценная процедура с диагностикой -------------------
-EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
+// --- 9.4. Извлечение: процедура с диагностикой -------------------------------
+//
+// Порядок действий:
+//   1) найти узел устройства (USB\VID_...), а не дочерний USBSTOR\DISK...;
+//   2) снять блокировки и сбросить кэши на томах (если они есть);
+//   3) CM_Request_Device_Eject — обязательный запрос по заданию;
+//   4) проверить, что устройство действительно ушло;
+//   5) если Windows отказала — объяснить причину (CONFIGRET + veto + тома),
+//      а при явном подтверждении пользователя отключить узел через SetupAPI
+//      и сразу включить его обратно, чтобы он не «пропал» после переподключения.
+EjectResult EjectDisk(UsbDisk& disk, bool elevated, bool allow_fallback) {
     EjectResult result;
 
     std::wstring target_id;
-    const DEVINST node = EjectTargetNode(disk, target_id);
-    if (node == 0) {
+    const DEVINST usbstor_node = EjectTargetNode(disk, target_id);
+    if (usbstor_node == 0) {
         result.cr = CR_NO_SUCH_DEVNODE;
         result.last_error = GetLastError();
         result.message = L"Устройство не найдено — возможно, оно уже отключено";
@@ -1440,6 +1558,36 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
         return result;
     }
     result.target_id = target_id;
+
+    // Узел физического USB-устройства (USB\VID_xxxx&PID_xxxx\...).
+    DEVINST usb_node = 0;
+    if (CM_Locate_DevNodeW(&usb_node, const_cast<DEVINSTID_W>(target_id.c_str()),
+                           CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) {
+        usb_node = 0;
+    }
+
+    // Отключённый узел: извлекать нечего, и это главная причина «не видит».
+    if (usb_node != 0 && NodeDisabled(usb_node)) {
+        DWORD error = 0;
+        if (elevated && ChangeDeviceState(target_id, DICS_ENABLE, error)) {
+            result.cr = CR_SUCCESS;
+            result.ok = true;
+            result.fallback_used = true;
+            result.message = L"Устройство было отключено — включено обратно";
+            result.advice = {L"Обновите список (F5): накопитель должен появиться.",
+                             L"Если он был отключён ранее, теперь Windows снова его видит."};
+            disk.eject_note = L"DICS_ENABLE (устройство было отключено)";
+            return result;
+        }
+        result.cr = CR_REMOVE_VETOED;
+        result.veto = PNP_VetoNonDisableable;
+        result.message = L"Устройство отключено в системе";
+        result.advice = {L"Windows не видит этот узел, потому что он отключён.",
+                         L"Нажмите «Диагностика» (Ctrl+D) — в списке будет",
+                         L"«CM_PROB_DISABLED (22) — устройство отключено».",
+                         L"Запустите программу от имени администратора: она включит узел."};
+        return result;
+    }
 
     // Системный диск извлекать нельзя: предупреждаем до запроса.
     if (disk.system) {
@@ -1451,15 +1599,16 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
         return result;
     }
 
-    // Шаг 1: подготовка томов. Для телефонов (MTP) томов нет — шаг пустой.
+    // Шаг 1: подготовка томов. Для MTP-устройств томов нет — шаг пустой.
     std::vector<std::wstring> notes;
-    if (!disk.volumes.empty()) PrepareVolumesForEject(disk, notes);
+    std::vector<wchar_t> dismounted;
+    if (!disk.volumes.empty()) dismounted = PrepareVolumesForEject(disk, notes);
 
-    // Шаг 2: сам запрос на извлечение (требование задания — CM_Request_Device_Eject).
+    // Шаг 2: запрос на извлечение.
     //   CONFIGRET CM_Request_Device_EjectW(DEVINST, PNP_VETO_TYPE*, PWSTR, ULONG, ULONG)
     PNP_VETO_TYPE veto = PNP_VetoTypeUnknown;
     wchar_t veto_name[MAX_PATH] = {};
-    const CONFIGRET cr = CM_Request_Device_EjectW(node, &veto, veto_name,
+    const CONFIGRET cr = CM_Request_Device_EjectW(usbstor_node, &veto, veto_name,
                                                   (ULONG)std::size(veto_name), 0);
     const DWORD api_error = GetLastError();
 
@@ -1469,15 +1618,14 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
     result.last_error = api_error;
 
     if (cr == CR_SUCCESS) {
-        // Важно: CR_SUCCESS ещё не значит, что устройство ушло. Проверяем.
+        // CR_SUCCESS ещё не значит, что устройство ушло: проверяем.
         result.came_back = !WaitDeviceGone(disk.instance_id);
         result.ok = true;
         if (result.came_back) {
             result.message = L"Запрос принят, но устройство осталось подключённым";
             result.advice = {
                 L"Windows сняла питание с порта, однако узел устройства не исчез.",
-                L"Если накопитель всё ещё виден в Проводнике — извлеките его повторно",
-                L"или отключите физически: данные уже сброшены на носитель."};
+                L"Данные на носителе уже сброшены — отключить физически можно и так."};
         } else {
             result.message = L"Накопитель извлечён — можно отключать";
             result.advice = {L"Кэши сброшены, тома размонтированы, питание порта снято."};
@@ -1486,7 +1634,14 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
         return result;
     }
 
-    // Шаг 3: отказ. Разбираем причину: код CONFIGRET + Veto-тип + GetLastError.
+    // Шаг 3: отказ. Сначала возвращаем тома в рабочее состояние: подготовка
+    // уже размонтировала их, и без этого диск выглядел бы «пропавшим».
+    if (!dismounted.empty()) {
+        RemountVolumes(dismounted);
+        notes.push_back(L"Тома смонтированы обратно: извлечение не состоялось.");
+    }
+
+    // Объясняем причину: код CONFIGRET + Veto-тип + GetLastError.
     result.ok = false;
     result.message = Format(L"Извлечение отклонено: %s", VetoText(veto).c_str());
     result.advice = VetoAdvice(veto);
@@ -1497,33 +1652,68 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
     }
     for (const std::wstring& note : notes) result.advice.push_back(note);
 
-    // Причина «неизвестна» — проверяем тома самостоятельно.
     if (veto == PNP_VetoTypeUnknown && !disk.volumes.empty()) {
         DiagnoseVolumes(disk, result.advice);
     }
 
-    // Шаг 4: fallback. Если драйвер не умеет извлекаться, но у нас есть права
-    // администратора — штатно отключаем узел (как Диспетчер устройств).
-    if (elevated) {
-        DWORD disable_error = 0;
-        if (DisableDeviceNode(disk.instance_id, disable_error) &&
-            WaitDeviceGone(disk.instance_id)) {
-            result.ok = true;
-            result.fallback_used = true;
-            result.message = L"Устройство отключено программно (DICS_DISABLE)";
-            result.advice.insert(result.advice.begin(),
-                                 {L"Драйвер отклонил извлечение, поэтому узел отключён "
-                                  L"через SetupAPI — данные сброшены на носитель.",
-                                  L"Отключить накопитель физически можно сразу."});
-            disk.eject_note = L"CM_Request_Device_Eject отклонён, выполнен DICS_DISABLE";
+    // Шаг 4: резервное отключение — ТОЛЬКО по подтверждению пользователя.
+    // Без подтверждения устройство может остаться отключённым навсегда,
+    // и после переподключения его не увидит ни программа, ни Проводник.
+    if (allow_fallback && elevated) {
+        const std::wstring confirm =
+            L"Извлечение через CM_Request_Device_Eject отклонено.\n\n" + result.message +
+            L"\n\nОтключить устройство программно (как в Диспетчере устройств)?\n"
+            L"Программа сразу включит его обратно, чтобы оно не пропало\n"
+            L"после переподключения.";
+        if (MessageBoxW(nullptr, confirm.c_str(), L"USB-накопители",
+                        MB_YESNO | MB_ICONWARNING) != IDYES) {
+            return result;
+        }
+
+        DWORD error = 0;
+        if (ChangeDeviceState(target_id, DICS_DISABLE, error)) {
+            const bool gone = WaitDeviceGone(target_id, 8, 150);
+
+            // Сразу возвращаем узел в рабочее состояние: иначе Windows
+            // запомнит «отключено» и флешка исчезнет после переподключения.
+            DWORD enable_error = 0;
+            const bool enabled = ChangeDeviceState(target_id, DICS_ENABLE, enable_error);
+            if (!enabled) {
+                result.advice.push_back(
+                    Format(L"ВНИМАНИЕ: включить узел обратно не удалось (ошибка %lu).",
+                           enable_error));
+                result.advice.push_back(
+                    L"Включите его в Диспетчере устройств или переподключите кабель.");
+            }
+
+            if (gone) {
+                result.ok = true;
+                result.fallback_used = true;
+                result.message = L"Устройство отключено программно";
+                result.advice.insert(
+                    result.advice.begin(),
+                    {L"Драйвер отклонил извлечение, узел отключён через SetupAPI.",
+                     enabled ? L"Узел сразу включён обратно — после переподключения "
+                               L"накопитель снова определится."
+                             : L"Узел остался отключён — включите его вручную.",
+                     L"Данные на носителе сброшены, физически отключать можно."});
+                disk.eject_note = L"CM_Request_Device_Eject отклонён, выполнен DICS_DISABLE";
+            } else {
+                result.advice.push_back(
+                    L"Узел отключён, но из системы не исчез — скорее всего, его");
+                result.advice.push_back(
+                    L"держит драйвер. Закройте программы и повторите извлечение.");
+            }
         } else {
             result.advice.push_back(
-                Format(L"Отключение узла тоже не удалось (ошибка %lu).", disable_error));
+                Format(L"Отключение узла тоже не удалось (ошибка %lu).", error));
+            result.advice.push_back(
+                L"Проверьте, что программа запущена от имени администратора.");
         }
-    } else {
+    } else if (!elevated) {
         result.advice.push_back(
-            L"Запустите программу от имени администратора: тогда при отказе драйвера "
-            L"узел будет отключён программно.");
+            L"Для резервного отключения нужны права администратора: нажмите");
+        result.advice.push_back(L"«Запустить от администратора» в карточке «Действия».");
     }
 
     if (!result.ok && result.veto == PNP_VetoTypeUnknown && notes.empty() &&
@@ -1536,10 +1726,6 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
     }
     return result;
 }
-
-// ===========================================================================
-//  10. Главное окно: вся логика приложения
-// ===========================================================================
 
 // ===========================================================================
 //  9.5. Диагностика для отчёта и кнопки «Диагностика»
@@ -1769,7 +1955,7 @@ public:
         wc.lpszClassName = kClassName;
         if (!RegisterClassExW(&wc)) return false;
 
-        hwnd_ = CreateWindowExW(0, kClassName, L"USB-накопители — ЛР №5 (вариант А1)",
+        hwnd_ = CreateWindowExW(0, kClassName, L"USB-накопители",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
                                 CW_USEDEFAULT, S(1180), S(880), nullptr, nullptr, inst_, this);
         if (!hwnd_) return false;
@@ -1789,7 +1975,7 @@ public:
                 L"Перезапустить программу с повышенными правами?\n"
                 L"(Если выбрать «Нет», извлечение через CM_Request_Device_Eject всё равно\n"
                 L"попробует выполниться, а причина отказа будет показана в журнале.)",
-                L"ЛР №5 — права администратора", MB_YESNO | MB_ICONQUESTION);
+                L"USB-накопители", MB_YESNO | MB_ICONQUESTION);
             if (answer == IDYES && RelaunchElevated()) {
                 DestroyWindow(hwnd_);
                 return 0;   // новый экземпляр уже работает с правами
@@ -1997,6 +2183,17 @@ private:
                                                   DEVICE_NOTIFY_WINDOW_HANDLE);
 
         AddLog(0, L"Приложение запущено");
+
+        // Если приложение ранее отключало узел и не успело включить его
+        // обратно (закрытие, сбой), Windows запомнит «отключено» и флешки
+        // не будет ни в программе, ни в Проводнике. При наличии прав
+        // включаем все отключённые USBSTOR-узлы обратно.
+        if (elevated_) {
+            const int fixed = EnableDisabledUsbDevices();
+            if (fixed > 0) {
+                AddLog(3, Format(L"Включено отключённых устройств: %d", fixed));
+            }
+        }
         AddLog(0, elevated_ ? L"Права: администратор — извлечение и IOCTL доступны"
                             : L"Права: обычные — для извлечения может понадобиться администратор");
         if (!notify_volume_ && !notify_usb_ && !notify_wpd_) {
@@ -2086,8 +2283,7 @@ private:
         for (int i = 0; i < (int)disks_.size(); ++i) {
             const UsbDisk& disk = disks_[i];
             // В список кладём только индекс: всю строку рисует визуал по
-            // visual::Model::rows (как и в ЛР №4, где Model — единственный
-            // канал «логика -> оформление»).
+            // visual::Model::rows (Model — единственный канал «логика -> оформление»).
             const std::wstring line = std::to_wstring(i);
             const int index = (int)SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)line.c_str());
             if (index >= 0) {
@@ -2102,12 +2298,25 @@ private:
         UpdateModel();
         InvalidateRect(hwnd_, nullptr, FALSE);
 
-        AddLog(0, Format(L"Перечисление завершено: устройств %d", (int)disks_.size()));
+        // Если список пуст, а флешка в системе есть — скорее всего её узел
+        // отключён (например, предыдущим «отключением»). Это главная причина
+        // «компьютер видит, программа — нет», поэтому пишем подсказку.
+        const bool hidden_by_disable = disks_.empty() && AnyMassStoragePresent();
+        hidden_by_disable_ = hidden_by_disable;
+        if (hidden_by_disable && !quiet) {
+            AddLog(1, L"Флешка есть в системе, но её узел отключён — нажмите");
+            AddLog(1, L"  «Диагностика» (Ctrl+D): в списке будет CM_PROB_DISABLED (22).");
+            AddLog(1, L"  Запустите от администратора: программа включит устройство.");
+        }
+
+        // Журнал «перечисление завершено» пишем только для действий
+        // пользователя (F5, запуск): на каждое WM_DEVICECHANGE это был бы шум.
         if (!quiet) {
+            AddLog(0, Format(L"Перечисление завершено: устройств %d", (int)disks_.size()));
             if (disks_.empty()) {
-                Notify(L"USB-накопители не найдены", 1);
+                Notify(L"Устройства не найдены", 1);
             } else {
-                Notify(Format(L"Найдено накопителей: %d", (int)disks_.size()), 0);
+                Notify(Format(L"Найдено устройств: %d", (int)disks_.size()), 0);
             }
         }
     }
@@ -2243,7 +2452,25 @@ private:
                                       ? L"—"
                                       : Format(L"PhysicalDrive%lu", disk.device_number));
             field(L"Сектор", disk.sector_size ? Format(L"%d байт", disk.sector_size) : L"—");
-            field(L"Состояние", disk.system ? L"содержит системный том" : L"готов к извлечению");
+            std::wstring state = disk.system ? L"содержит системный том" : L"готов к извлечению";
+            if (disk.no_access) {
+                DEVINST node = 0;
+                const bool located =
+                    CM_Locate_DevNodeW(&node, const_cast<DEVINSTID_W>(disk.instance_id.c_str()),
+                                       CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS;
+                if (located && NodeDisabled(node)) {
+                    state = L"отключено в системе (код 22)";
+                } else if (located && NodeProblem(node) != 0) {
+                    state = Format(L"проблема драйвера (код %lu)", NodeProblem(node));
+                } else {
+                    state = Format(L"нет доступа (ошибка %lu)", disk.access_error);
+                }
+            }
+            field(L"Состояние", state);
+            if (disk.no_access) {
+                field(L"Что делать",
+                      L"«Запустить от администратора» — включит устройство обратно");
+            }
         } else {
             // Режим подключения телефона — главное, что нужно объяснить:
             // в MTP-режиме буквы диска не будет никогда.
@@ -2300,7 +2527,8 @@ private:
         // поэтому перерисовываем окно до начала работы и после неё.
         UpdateWindow(hwnd_);
 
-        EjectResult result = EjectDisk(disk, elevated_);
+        const bool was_elevated = elevated_;
+        EjectResult result = EjectDisk(disk, elevated_, /*allow_fallback=*/true);
 
         AddLog(result.ok ? 3 : 2, result.message);
         AddLog(0, Format(L"  CM_Request_Device_Eject: %s", ConfigRetText(result.cr).c_str()));
@@ -2314,7 +2542,12 @@ private:
         if (result.ok) {
             disk.present = false;
             busy_ = false;
-            Refresh(true);   // устройство исчезло — перечитываем список
+            // Небольшая пауза и повторное чтение: после извлечения дерево
+            // устройств обновляется не мгновенно, иначе строка остаётся.
+            Sleep(250);
+            Refresh(true);
+            // Устройство могло вернуться (например, после DICS_ENABLE) —
+            // тогда показываем его снова, а не пустой список.
             return;
         }
 
@@ -2326,11 +2559,11 @@ private:
         // Без прав администратора драйвер почти всегда отвечает отказом.
         // Предлагаем перезапустить программу с повышением прав — сразу,
         // пока пользователь видит причину отказа в журнале.
-        if (!elevated_) {
+        if (!was_elevated) {
             const std::wstring question =
                 L"Извлечение отклонено.\n\n" + result.message +
                 L"\n\nЗапустить программу от имени администратора и повторить?";
-            if (MessageBoxW(hwnd_, question.c_str(), L"ЛР №5 — нужны права администратора",
+            if (MessageBoxW(hwnd_, question.c_str(), L"USB-накопители",
                             MB_YESNO | MB_ICONWARNING) == IDYES) {
                 if (RelaunchElevated()) DestroyWindow(hwnd_);
             }
@@ -2345,7 +2578,7 @@ private:
         const std::wstring path = ReportPath(report_dir_);
 
         std::wstring text;
-        text += L"ЛР №5. Программирование шины USB. Вариант А1 — USB Flash (Mass Storage)\r\n";
+        text += L"ЛР №5. Программирование шины USB. USB-накопители (Mass Storage)\r\n";
         text += L"Платформа: Windows, SetupAPI + CfgMgr32 + IOCTL\r\n";
         text += L"Отчёт сформирован: " + NowStamp(false) + L"\r\n";
         text += L"Права процесса: " + std::wstring(elevated_ ? L"администратор" : L"обычные") + L"\r\n";
@@ -2521,43 +2754,51 @@ private:
     //  Горячее подключение: WM_DEVICECHANGE
     // -----------------------------------------------------------------------
     void OnDeviceChange(WPARAM event, LPARAM data) {
-        if (event != DBT_DEVICEARRIVAL && event != DBT_DEVICEREMOVECOMPLETE &&
-            event != DBT_DEVNODES_CHANGED) {
+        if (event == DBT_DEVNODES_CHANGED) {
+            // Общее «дерево изменилось» приходит на каждое устройство в составе
+            // одного подключения (диск, том, USB-узел). Записывать его в журнал
+            // нельзя: получится 3–5 одинаковых строк на одно подключение.
+            // Достаточно молча обновить список.
+            RequestAutoRefresh();
             return;
         }
+        if (event != DBT_DEVICEARRIVAL && event != DBT_DEVICEREMOVECOMPLETE) return;
 
         const bool arrival = event == DBT_DEVICEARRIVAL;
-        std::wstring what;
 
+        // Один накопитель даёт несколько интерфейсов (USB-устройство, том,
+        // USBSTOR). Сообщение показываем только про самый «содержательный»:
+        // том для флешки, WPD для телефона.
+        bool volume = false, portable = false, usb_device = false;
         auto* header = reinterpret_cast<DEV_BROADCAST_HDR*>(data);
         if (header && header->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE) {
             auto* iface = reinterpret_cast<DEV_BROADCAST_DEVICEINTERFACE_W*>(header);
             const std::wstring name = Uppercase(iface->dbcc_name);
-
-            // Что именно подключилось: накопитель (USBSTOR/VOLUME) или
-            // телефон/плеер (WPD). Для WPD разбираем VID/PID прямо из пути
-            // устройства: \\?\usb#vid_18d1&pid_4ee2#...
-            if (name.find(L"USBSTOR") != std::wstring::npos ||
-                IsEqualGUID(iface->dbcc_classguid, GUID_DEVINTERFACE_VOLUME)) {
-                what = L"USB-накопитель";
-            } else if (IsEqualGUID(iface->dbcc_classguid, GUID_DEVCLASS_WPD) ||
-                       name.find(L"WPD") != std::wstring::npos) {
-                what = L"MTP-устройство (телефон/плеер)";
-            } else if (IsEqualGUID(iface->dbcc_classguid, GUID_DEVINTERFACE_USB_DEVICE) ||
-                       name.find(L"USB#VID_") != std::wstring::npos) {
-                what = L"USB-устройство";
-            } else {
-                return;   // чужие интерфейсы игнорируем
+            volume = IsEqualGUID(iface->dbcc_classguid, GUID_DEVINTERFACE_VOLUME) ||
+                     name.find(L"USBSTOR") != std::wstring::npos;
+            portable = IsEqualGUID(iface->dbcc_classguid, GUID_DEVCLASS_WPD) ||
+                       name.find(L"WPD") != std::wstring::npos;
+            usb_device = IsEqualGUID(iface->dbcc_classguid, GUID_DEVINTERFACE_USB_DEVICE) ||
+                         name.find(L"USB#VID_") != std::wstring::npos;
+            if (!volume && !portable && !usb_device) {
+                RequestAutoRefresh();
+                return;   // чужие интерфейсы (мышь, камера и т.п.) игнорируем
             }
         }
 
-        if (event != DBT_DEVNODES_CHANGED) {
-            const std::wstring text = what.empty()
-                                          ? (arrival ? L"Подключено устройство"
-                                                     : L"Отключено устройство")
-                                          : (arrival ? L"Подключено: " : L"Отключено: ") + what;
-            AddLog(arrival ? 3 : 0, text + L" (WM_DEVICECHANGE)");
-            Notify(text, arrival ? 3 : 0);
+        // Окно «тишины»: все интерфейсы одного подключения приходят почти
+        // одновременно. Первое событие пишем в журнал, остальные в течение
+        // 1,5 с только обновляют список.
+        const ULONGLONG now = GetTickCount64();
+        const bool quiet_period = now < device_event_until_;
+        device_event_until_ = now + 1500;
+
+        if (!quiet_period) {
+            std::wstring what = volume     ? L"USB-накопитель"
+                                : portable ? L"MTP-устройство (телефон/плеер)"
+                                           : L"USB-устройство";
+            AddLog(arrival ? 3 : 0, (arrival ? L"Подключено: " : L"Отключено: ") + what);
+            Notify(arrival ? L"Подключено: " + what : L"Отключено: " + what, arrival ? 3 : 0);
         }
         RequestAutoRefresh();
     }
@@ -2639,7 +2880,9 @@ private:
     bool started_elevated_ = false;   // пришли как «--elevated»
     bool busy_ = false;
     bool scan_failed_ = false;
-    ULONGLONG auto_refresh_at_ = 0;   // время, когда можно обновлять список
+    bool hidden_by_disable_ = false;   // флешка есть, но её узел отключён
+    ULONGLONG auto_refresh_at_ = 0;       // время, когда можно обновлять список
+    ULONGLONG device_event_until_ = 0;    // окно «тишины» для WM_DEVICECHANGE
 
     HDEVNOTIFY notify_volume_ = nullptr;
     HDEVNOTIFY notify_usb_ = nullptr;
@@ -2673,7 +2916,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
         SetDpi(dpi);
     }
 
-    // GDI+ — основа оформления (как в ЛР №4).
+    // GDI+ — основа оформления.
     Gdiplus::GdiplusStartupInput gdiplus_input;
     ULONG_PTR gdiplus_token = 0;
     if (Gdiplus::GdiplusStartup(&gdiplus_token, &gdiplus_input, nullptr) != Gdiplus::Ok) return 1;
