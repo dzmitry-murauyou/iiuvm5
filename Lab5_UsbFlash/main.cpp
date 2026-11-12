@@ -2430,8 +2430,10 @@ private:
         };
 
         field(L"Тип устройства", disk.device_kind);
-        field(L"VID", disk.vid);
-        field(L"PID", disk.pid);
+        // VID и PID — одна строка: так характеристики помещаются в карточку
+        // целиком даже на минимальном размере окна.
+        field(L"VID / PID", Format(L"%s / %s", disk.vid.empty() ? L"—" : disk.vid.c_str(),
+                                   disk.pid.empty() ? L"—" : disk.pid.c_str()));
         field(L"Источник VID/PID", disk.usb_id_source);
         field(L"Серийный номер", disk.serial);
         field(L"Производитель", disk.manufacturer);
