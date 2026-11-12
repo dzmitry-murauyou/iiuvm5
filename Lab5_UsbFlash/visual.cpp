@@ -43,10 +43,11 @@ const Color Accent(255, 84, 160, 255);   // «USB»-акцент интерфе�
 const int Pad = 22;         // поля окна
 const int Gap = 12;         // между карточками
 const int HeaderH = 92;     // шапка
-const int LogH = 120;       // карточка журнала
+const int LogH = 262;       // журнал: заголовок, строка подсказки и девять записей
 const int ActionH = 148;    // карточка «Действия»
-const int PanelW = 392;     // карточка «Устройство»
-const int RowH = 26;        // строка «подпись — значение»
+const int PanelW = 556;     // карточка «Устройство» на всю высоту окна
+const int RowH = 25;        // строка «подпись — значение»
+const int LabelW = 168;     // колонка подписей в карточке «Устройство»
 const int InnerPad = 16;    // поле внутри карточки
 const REAL Radius = 6.0f;
 const int ItemH = 58;       // строка списка накопителей
@@ -137,13 +138,11 @@ void Separator(Graphics& g, const RECT& card, int y) {
 
 // Строка «подпись — значение»: подпись в фиксированной колонке, значение —
 // в остатке ширины с многоточием.
-void Row(Graphics& g, const RECT& card, int y, const std::wstring& label,
-         const std::wstring& value, Font* label_font, Font* value_font) {
-    const int p = S(theme::InnerPad);
-    const int label_w = S(112);
-    RECT l{card.left + p, y, std::min(card.left + p + label_w, card.right - p),
-           y + S(theme::RowH)};
-    RECT v{l.right, y, card.right - p, y + S(theme::RowH)};
+void Row(Graphics& g, const int label_left, const int value_left, const int right, int y,
+         const std::wstring& label, const std::wstring& value, Font* label_font,
+         Font* value_font) {
+    RECT l{label_left, y, std::min(value_left, right), y + S(theme::RowH)};
+    RECT v{value_left, y, right, y + S(theme::RowH)};
     TextG(g, label, l, label_font, theme::Sub);
     TextG(g, value.empty() ? L"—" : value, v, value_font, theme::Txt);
 }
@@ -266,23 +265,29 @@ void View::AddLogLine(const std::wstring& line, int level) {
     const int index = (int)SendMessageW(h_log_, LB_ADDSTRING, 0, (LPARAM)line.c_str());
     if (index < 0) return;
     SendMessageW(h_log_, LB_SETITEMDATA, index, (LPARAM)level);
-    SendMessageW(h_log_, LB_SETTOPINDEX, index, 0);
     // Список не растёт бесконечно: старые строки уходят, полный журнал — в файле.
-    while (SendMessageW(h_log_, LB_GETCOUNT, 0, 0) > 500) {
+    while (SendMessageW(h_log_, LB_GETCOUNT, 0, 0) > 2000) {
         SendMessageW(h_log_, LB_DELETESTRING, 0, 0);
     }
+    ScrollLogToEnd();
+}
+
+void View::ScrollLogToEnd() {
+    if (!h_log_) return;
+    const int count = (int)SendMessageW(h_log_, LB_GETCOUNT, 0, 0);
+    if (count > 0) SendMessageW(h_log_, LB_SETTOPINDEX, count - 1, 0);
 }
 
 int View::MinWidth() const {
     // карточка списка (кнопки «Обновить»/«Диагностика»/«Обзор…» + счётчик)
     // + карточка устройства (PanelW) + отступы и поля окна
-    return S(theme::Pad * 2 + 476 + theme::Gap + theme::PanelW + 40);
+    return S(theme::Pad * 2 + 470 + theme::Gap + theme::PanelW);
 }
 
 int View::MinHeight() const {
-    // шапка + список (три строки) + действия + журнал + поля окна
-    return S(theme::Pad * 2 + theme::HeaderH + theme::Gap +
-             42 + 3 * theme::ItemH + theme::Gap + theme::ActionH + theme::Gap + theme::LogH);
+    // шапка + список (две строки) + действия + журнал + поля окна
+    return S(theme::HeaderH + theme::Gap + 80 + 2 * theme::ItemH + theme::Gap + theme::ActionH +
+             theme::Gap + theme::LogH + theme::Pad);
 }
 
 // ---------------------------------------------------------------------------
@@ -299,28 +304,31 @@ void View::Layout() {
     const int pad = S(theme::Pad), gap = S(theme::Gap);
     const int p = S(theme::InnerPad);
 
-    log_rc_ = {pad, h - pad - S(theme::LogH), w - pad, h - pad};
-    action_rc_ = {pad, log_rc_.top - gap - S(theme::ActionH), w - pad, log_rc_.top - gap};
-    header_rc_ = {0, 0, w, S(theme::HeaderH)};
+    // Слева, сверху вниз: список накопителей, «Действия», журнал.
+    // Эти три карточки занимают всю высоту окна и задают нижнюю границу.
+    log_rc_ = {pad, h - pad - S(theme::LogH), w - pad - S(theme::PanelW) - gap, h - pad};
+    action_rc_ = {pad, log_rc_.top - gap - S(theme::ActionH), log_rc_.right,
+                  log_rc_.top - gap};
+    list_rc_ = {pad, S(theme::HeaderH), log_rc_.right, action_rc_.top - gap};
 
-    // Слева — список накопителей, справа — карточка свойств.
-    panel_rc_ = {w - pad - S(theme::PanelW), S(theme::HeaderH), w - pad, action_rc_.top - gap};
-    list_rc_ = {pad, S(theme::HeaderH), panel_rc_.left - gap, action_rc_.top - gap};
+    // Справа — карточка «Устройство» во всю высоту окна: характеристик
+    // много, и все они должны помещаться без прокрутки.
+    panel_rc_ = {w - pad - S(theme::PanelW), S(theme::HeaderH), w - pad, h - pad};
+    header_rc_ = {0, 0, w, S(theme::HeaderH)};
 
     // --- шапка -------------------------------------------------------------
     // Метки фиксированной ширины: справа «права процесса», левее — состояние
     // поиска. Заголовок получает остаток и обрезается многоточием, поэтому
     // наезжать на метки он не может ни при каком тексте.
     {
-        const int cy = S(22), pill_h = S(30);
+        const int cy = S(22), pill_h = S(30);   // шапка 92 DIP: полоса 22…52
         const int rights_w = S(172);
         const int state_w = S(232);
         rights_pill_ = {w - pad - rights_w, cy, w - pad, cy + pill_h};
         state_pill_ = {rights_pill_.left - S(10) - state_w, cy, rights_pill_.left - S(10),
                        cy + pill_h};
     }
-    title_rc_ = {pad, S(14), state_pill_.left - S(16), S(50)};
-    subtitle_rc_ = {pad, S(52), state_pill_.left - S(16), S(74)};
+    title_rc_ = {pad, S(22), state_pill_.left - S(16), S(52)};
 
     // --- карточка «USB-накопители» ----------------------------------------
     {
@@ -366,14 +374,10 @@ void View::Layout() {
         separator_y_ = panel_rc_.top + S(100);
         fields_top_ = separator_y_ + S(10);
 
-        // Адаптивная раскладка: показываем столько строк, сколько влезает,
-        // остальные просто не рисуются (полная информация есть в отчёте).
+        // Сколько строк помещается по высоте карточки — столько и рисуем.
         const int bottom_limit = panel_rc_.bottom - S(12);
-        const int hint_h = S(26);
-        const int space = bottom_limit - fields_top_ - hint_h;
-        panel_rows_ = std::clamp(space / S(theme::RowH), 0, 12);
-
-        hint_rc_ = {left, bottom_limit - S(22), right, bottom_limit};
+        const int space = bottom_limit - fields_top_;
+        panel_rows_ = std::max(1, (int)(space / S(theme::RowH)));
     }
 
     // --- карточка «Действия» ----------------------------------------------
@@ -415,7 +419,11 @@ void View::Layout() {
     {
         log_head_ = {log_rc_.left + p, log_rc_.top + S(8), log_rc_.right - p,
                      log_rc_.top + S(30)};
-        const int top = log_rc_.top + S(38);
+        // Вторая строка карточки — горячие клавиши: на узком окне они
+        // не помещаются рядом с заголовком, поэтому идут отдельной строкой.
+        log_keys_ = {log_rc_.left + p, log_rc_.top + S(30), log_rc_.right - p,
+                     log_rc_.top + S(48)};
+        const int top = log_rc_.top + S(52);
         SetWindowPos(h_log_, nullptr, log_rc_.left + p, top,
                      log_rc_.right - log_rc_.left - 2 * p,
                      std::max(S(40), (int)log_rc_.bottom - S(12) - top), SWP_NOZORDER);
@@ -476,7 +484,6 @@ void View::Paint(HDC dc, const RECT& client, const Model& model) {
     DrawPanel(g, model);
     DrawActions(g);
     DrawLogCard(g);
-    DrawToasts(g);
 }
 
 // Метка-«пилюля»: цветная точка и текст. Ширина уже посчитана в Layout()
@@ -495,7 +502,6 @@ void View::DrawHeader(Graphics& g, const Model& model) {
     g.SetClip(RectF(0.0f, 0.0f, (REAL)std::max<LONG>(1, header_rc_.right), (REAL)S(theme::HeaderH)));
 
     TextG(g, L"USB-накопители", title_rc_, f_title_, theme::Txt);
-    TextG(g, L"SetupAPI · IOCTL · безопасное извлечение", subtitle_rc_, f_label_, theme::Sub);
 
     // Слева направо: состояние поиска, затем права процесса.
     DrawPill(g, state_pill_, model.status.empty() ? L"Поиск устройств…" : model.status,
@@ -600,15 +606,15 @@ void View::DrawPanel(Graphics& g, const Model& model) {
 
     Separator(g, panel_rc_, separator_y_);
 
-    // Строки идут сверху вниз; рисуются только те, что поместились.
-    int y = fields_top_;
-    for (int i = 0; i < panel_rows_ && i < (int)model.fields.size(); ++i) {
-        Row(g, panel_rc_, y, model.fields[i].label, model.fields[i].value, f_label_, f_value_);
-        y += S(theme::RowH);
-    }
+    // Одна широкая колонка: подпись фиксированной ширины, значение — остаток.
+    const int p = S(theme::InnerPad);
+    const int label_left = panel_rc_.left + p;
+    const int value_left = label_left + S(theme::LabelW);
 
-    TextG(g, L"Полные сведения — в отчёте («Сохранить отчёт»)", hint_rc_, f_label_,
-          theme::Dim);
+    for (int i = 0; i < panel_rows_ && i < (int)model.fields.size(); ++i) {
+        Row(g, label_left, value_left, panel_rc_.right - p, fields_top_ + i * S(theme::RowH),
+            model.fields[i].label, model.fields[i].value, f_label_, f_value_);
+    }
 
     g.ResetClip();
 }
@@ -640,10 +646,10 @@ void View::DrawLogCard(Graphics& g) {
     Card(g, log_rc_);
     TextG(g, L"Журнал событий", log_head_, f_section_, theme::Txt);
 
-    // Горячие клавиши — справа в заголовке карточки.
-    RECT keys{log_head_.left, log_head_.top, log_head_.right, log_head_.bottom};
-    TextG(g, L"F5 — обновить · Ctrl+E — извлечь · Ctrl+S — отчёт · Ctrl+D — диагностика", keys,
-          f_label_, theme::Dim, StringAlignmentFar);
+    // Горячие клавиши — отдельной строкой под заголовком карточки.
+    TextG(g, L"F5 обновить · Ctrl+E извлечь · Ctrl+L журнал · Ctrl+S отчёт · "
+             L"Ctrl+D диагностика",
+          log_keys_, f_label_, theme::Dim);
 
     g.ResetClip();
 }
@@ -665,63 +671,6 @@ bool View::DrawItem(const DRAWITEMSTRUCT* item) {
         default:
             return false;
     }
-}
-
-void View::PushToast(const std::wstring& text, int level) {
-    if (text.empty()) return;
-    if (toasts_.size() >= 3) toasts_.erase(toasts_.begin());   // старые уходят
-    toasts_.push_back({text, level, GetTickCount64() + 2600});
-}
-
-bool View::ExpireToasts() {
-    const ULONGLONG now = GetTickCount64();
-    toasts_.erase(std::remove_if(toasts_.begin(), toasts_.end(),
-                                 [now](const Toast& t) { return t.until <= now; }),
-                  toasts_.end());
-    return !toasts_.empty();
-}
-
-// Уведомления рисуются поверх карточки устройства, стопкой (до трёх сразу),
-// и плавно гаснут в последние 0,4 с.
-void View::DrawToasts(Graphics& g) {
-    if (toasts_.empty()) return;
-
-    const ULONGLONG now = GetTickCount64();
-    g.SetClip(RectF((REAL)panel_rc_.left, (REAL)panel_rc_.top,
-                    (REAL)(panel_rc_.right - panel_rc_.left),
-                    (REAL)(panel_rc_.bottom - panel_rc_.top)));
-
-    const int right = panel_rc_.right - S(12);
-    int y = panel_rc_.top + S(12);
-
-    for (auto it = toasts_.rbegin(); it != toasts_.rend(); ++it) {
-        const ULONGLONG left = it->until > now ? it->until - now : 0;
-        const int alpha = left < 400 ? (int)(255 * left / 400) : 255;
-        if (alpha <= 4) break;
-
-        Color accent = theme::Line;
-        if (it->level == 1) accent = theme::Warn;
-        else if (it->level == 2) accent = theme::Bad;
-        else if (it->level == 3) accent = theme::Good;
-
-        const int w = std::min(S(430), TextWidth(g, it->text, f_value_) + S(40));
-        const int h = S(34);
-        RECT rc{right - w, y, right, y + h};
-
-        RoundedRect(g, rc, Color((BYTE)(235 * alpha / 255), 18, 26, 44),
-                    Color((BYTE)alpha, accent.GetR(), accent.GetG(), accent.GetB()), RadiusPx());
-
-        RECT bar{rc.left + S(8), rc.top + S(8), rc.left + S(12), rc.bottom - S(8)};
-        FillRectG(g, bar, Color((BYTE)alpha, accent.GetR(), accent.GetG(), accent.GetB()));
-
-        RECT text_rc{rc.left + S(20), rc.top, rc.right - S(10), rc.bottom};
-        TextG(g, it->text, text_rc, f_value_, Color((BYTE)alpha, 235, 240, 248));
-
-        y += h + S(6);
-        if (y > panel_rc_.bottom - h) break;   // больше не помещается
-    }
-
-    g.ResetClip();
 }
 
 void View::DrawButton(const DRAWITEMSTRUCT* item) {
@@ -813,15 +762,15 @@ void View::DrawDeviceItem(const DRAWITEMSTRUCT* item) {
                       selected ? theme::Accent : theme::Sub);
     }
 
-    RECT title{card.left + S(60), card.top + S(8), card.right - S(96), card.top + S(32)};
+    RECT title{card.left + S(60), card.top + S(8), card.right - S(112), card.top + S(32)};
     TextG(g, row && !row->title.empty() ? row->title : L"USB-накопитель", title, f_value_,
           theme::Txt);
 
-    RECT sub{card.left + S(60), card.top + S(31), card.right - S(96), card.top + S(52)};
+    RECT sub{card.left + S(60), card.top + S(31), card.right - S(112), card.top + S(52)};
     TextG(g, row ? row->subtitle : L"", sub, f_log_, theme::Sub);
 
     // Справа: объём и метка наличия тома.
-    RECT cap{card.right - S(92), card.top + S(8), card.right - S(14), card.top + S(32)};
+    RECT cap{card.right - S(110), card.top + S(8), card.right - S(14), card.top + S(32)};
     TextG(g, row ? row->capacity : L"", cap, f_value_, theme::Txt, StringAlignmentFar);
 
     const bool system = row && row->system;
@@ -835,13 +784,13 @@ void View::DrawDeviceItem(const DRAWITEMSTRUCT* item) {
         tag = L"системный";
         tag_color = theme::Bad;
     } else if (has_drive) {
-        tag = L"том смонтирован";
+        tag = L"Том смонтирован";
         tag_color = theme::Good;
     } else {
         tag = L"без тома";
         tag_color = theme::Dim;
     }
-    RECT tag_rc{card.right - S(130), card.top + S(31), card.right - S(14), card.top + S(52)};
+    RECT tag_rc{card.right - S(180), card.top + S(31), card.right - S(14), card.top + S(52)};
     const int tag_w = TextWidth(g, tag, f_log_);
     Dot(g, tag_rc.right - tag_w - S(8), (tag_rc.top + tag_rc.bottom) / 2, S(4), tag_color);
     TextG(g, tag, tag_rc, f_log_, tag_color, StringAlignmentFar);

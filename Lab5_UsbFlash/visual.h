@@ -103,12 +103,10 @@ public:
     // Доступ к контролам для логики (список, выбор, каталог отчётов).
     HWND DeviceList() const { return h_list_; }
     HWND DirectoryEdit() const { return h_dir_; }
+    HWND DeviceLog() const { return h_log_; }
 
     void AddLogLine(const std::wstring& line, int level);
-
-    // Всплывающие уведомления внутри окна (короткие, до трёх одновременно).
-    void PushToast(const std::wstring& text, int level);
-    bool ExpireToasts();   // true, пока есть что показывать
+    void ScrollLogToEnd();   // журнал всегда показывает последние события
 
     HBRUSH FieldBrush() const { return field_brush_; }
 
@@ -134,7 +132,6 @@ private:
     void DrawPanel(Gdiplus::Graphics& g, const Model& model);
     void DrawActions(Gdiplus::Graphics& g);
     void DrawLogCard(Gdiplus::Graphics& g);
-    void DrawToasts(Gdiplus::Graphics& g);
 
     void DrawButton(const DRAWITEMSTRUCT* item);
     void DrawDeviceItem(const DRAWITEMSTRUCT* item);
@@ -161,25 +158,19 @@ private:
 
     // Геометрия карточек и элементов (в физических пикселях).
     RECT header_rc_{}, list_rc_{}, panel_rc_{}, action_rc_{}, log_rc_{};
-    RECT title_rc_{}, subtitle_rc_{}, state_pill_{}, rights_pill_{};
+    RECT title_rc_{}, state_pill_{}, rights_pill_{};
     RECT list_head_{}, list_count_{}, list_body_{};
-    RECT panel_head_{}, detail_title_rc_{}, detail_sub_rc_{}, hint_rc_{};
+    RECT panel_head_{}, detail_title_rc_{}, detail_sub_rc_{};
     RECT action_head_{}, dir_label_{}, dir_edit_rc_{};
-    RECT log_head_{};
+    RECT log_head_{}, log_keys_{};
 
-    int panel_rows_ = 6;       // сколько строк «подпись — значение» поместилось
+    int panel_rows_ = 6;       // строк «подпись — значение» в одной колонке
     int separator_y_ = 0;      // разделитель в карточке «Устройство»
     int fields_top_ = 0;       // верх первой строки свойств
 
-    struct Toast {
-        std::wstring text;
-        int level = 0;
-        ULONGLONG until = 0;
-    };
     // Копия строк списка на момент последней отрисовки: owner-draw строка
     // не имеет доступа к Model, поэтому визуал запоминает её у себя.
     std::vector<DeviceRow> list_rows_;
-    std::vector<Toast> toasts_;   // новые — в конце
 };
 
 }  // namespace visual

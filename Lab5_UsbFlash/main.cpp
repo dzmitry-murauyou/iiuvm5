@@ -266,7 +266,6 @@ struct EjectResult {
 
     // Диагностика: чем именно закончились этапы.
     DWORD last_error = 0;              // GetLastError после последнего вызова
-    bool came_back = false;            // устройство исчезло (проверено повторно)
     bool request_made = true;          // был ли сам запрос CM_Request_Device_Eject
 };
 
@@ -1715,7 +1714,6 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
                (!target_id.empty() && target_id != disk.instance_id &&
                 WaitDeviceGone(target_id));
         result.ok = gone;
-        result.came_back = !gone;
         result.message = gone ? L"Накопитель извлечён — можно отключать"
                               : L"Запрос принят, но устройство осталось в системе";
         result.advice = gone
@@ -1950,7 +1948,6 @@ const wchar_t* kClassName = L"Lab5UsbFlashWindow";
 class App {
 public:
     enum : UINT {
-        TIMER_TOAST = 1,          // гашение всплывающих уведомлений
         TIMER_AUTO_REFRESH = 2,   // отложенное обновление по WM_DEVICECHANGE
     };
 
@@ -1987,7 +1984,7 @@ public:
 
         hwnd_ = CreateWindowExW(0, kClassName, L"USB-накопители",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
-                                CW_USEDEFAULT, S(1180), S(880), nullptr, nullptr, inst_, this);
+                                CW_USEDEFAULT, S(1320), S(1000), nullptr, nullptr, inst_, this);
         if (!hwnd_) return false;
 
         ShowWindow(hwnd_, show);
@@ -2106,10 +2103,7 @@ private:
             }
 
             case WM_TIMER:
-                if (wp == TIMER_TOAST) {
-                    if (!view_.ExpireToasts()) KillTimer(hwnd_, TIMER_TOAST);
-                    InvalidateRect(hwnd_, nullptr, FALSE);
-                } else if (wp == TIMER_AUTO_REFRESH) {
+                if (wp == TIMER_AUTO_REFRESH) {
                     KillTimer(hwnd_, TIMER_AUTO_REFRESH);
                     auto_refresh_at_ = 0;
                     if (!busy_) Refresh(true);
@@ -2192,6 +2186,7 @@ private:
             {FVIRTKEY | FCONTROL, 'E', ID_EJECT},
             {FVIRTKEY | FCONTROL, 'S', ID_REPORT},
             {FVIRTKEY | FCONTROL, 'D', ID_DIAGNOSTICS},
+            {FVIRTKEY | FCONTROL, 'L', ID_LOG},          // журнал: фокус и конец списка
         };
         accel_ = CreateAcceleratorTableW(accel, (int)std::size(accel));
 
@@ -2280,11 +2275,6 @@ private:
         }
     }
 
-    void Notify(const std::wstring& text, int level) {
-        view_.PushToast(text, level);
-        SetTimer(hwnd_, TIMER_TOAST, 80, nullptr);
-    }
-
     // -----------------------------------------------------------------------
     //  Перечисление: сама работа (вызывается из UI-потока, время небольшое)
     // -----------------------------------------------------------------------
@@ -2339,9 +2329,9 @@ private:
         if (!quiet) {
             AddLog(0, Format(L"Перечисление завершено: устройств %d", (int)disks_.size()));
             if (disks_.empty()) {
-                Notify(L"Устройства не найдены", 1);
+                AddLog(1, L"Устройства не найдены");
             } else {
-                Notify(Format(L"Найдено устройств: %d", (int)disks_.size()), 0);
+                AddLog(0, Format(L"Найдено устройств: %d", (int)disks_.size()));
             }
         }
     }
@@ -2466,16 +2456,16 @@ private:
             for (const VolumeInfo& volume : disk.volumes) {
                 std::wstring text = volume.file_system;
                 if (!volume.label.empty()) text = volume.label + L" · " + text;
-                text += Format(L" · свободно %s из %s", HumanSize(volume.free).c_str(),
+                text += Format(L" · %s / %s", HumanSize(volume.free).c_str(),
                                HumanSize(volume.total).c_str());
                 field(Format(L"Том %c:", volume.letter).c_str(), text);
             }
 
             field(L"Съёмный", disk.removable ? L"да" : L"нет");
-            field(L"Защита от записи", disk.write_protected ? L"да" : L"нет");
-            field(L"Номер диска", disk.device_number == (DWORD)-1
-                                      ? L"—"
-                                      : Format(L"PhysicalDrive%lu", disk.device_number));
+            field(L"Запись", disk.write_protected ? L"защищён" : L"разрешена");
+            field(L"Диск", disk.device_number == (DWORD)-1
+                               ? L"—"
+                               : Format(L"PhysicalDrive%lu", disk.device_number));
             field(L"Сектор", disk.sector_size ? Format(L"%d байт", disk.sector_size) : L"—");
             std::wstring state = disk.system ? L"содержит системный том" : L"готов к извлечению";
             if (disk.no_access) {
@@ -2493,8 +2483,7 @@ private:
             }
             field(L"Состояние", state);
             if (disk.no_access) {
-                field(L"Что делать",
-                      L"«Запустить от администратора» — включит устройство (код 22)");
+                field(L"Что делать", L"«Запустить от администратора»");
             }
         } else {
             // Режим подключения телефона — главное, что нужно объяснить:
@@ -2505,9 +2494,8 @@ private:
             }
             field(L"Функции USB", functions.empty() ? L"—" : functions);
             field(L"Буквы дисков", L"нет: MTP не является диском");
-            field(L"Как получить диск",
-                  L"на телефоне: «USB → Передача файлов (UMS)», если есть");
-            field(L"Состояние", L"MTP-устройство: извлекается как устройство");
+            field(L"Как получить диск", L"«USB → Передача файлов (UMS)»");
+            field(L"Состояние", L"MTP: извлекается как устройство");
             field(L"Узел USB", disk.usb_node_id);
         }
 
@@ -2520,7 +2508,7 @@ private:
     void EjectSelected() {
         const int index = SelectedIndex();
         if (index < 0 || index >= (int)disks_.size()) {
-            Notify(L"Сначала выберите устройство в списке", 1);
+            AddLog(1, L"Сначала выберите устройство в списке");
             return;
         }
         if (busy_) return;   // идёт перечисление или другое извлечение
@@ -2528,7 +2516,6 @@ private:
 
         if (disk.system) {
             AddLog(1, L"Извлечение запрещено: накопитель содержит системный том");
-            Notify(L"Системный накопитель извлечь нельзя", 1);
             return;
         }
 
@@ -2570,8 +2557,6 @@ private:
         }
         for (const std::wstring& advice : result.advice) AddLog(0, L"  " + advice);
         if (!disk.eject_note.empty()) AddLog(0, L"  способ: " + disk.eject_note);
-
-        Notify(result.message, result.ok ? 3 : 2);
 
         if (result.ok) {
             disk.present = false;
@@ -2695,7 +2680,7 @@ private:
                                FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) {
             AddLog(2, L"Не удалось сохранить отчёт: " + FileName(path));
-            Notify(L"Не удалось сохранить отчёт", 2);
+            AddLog(2, L"Не удалось сохранить отчёт");
             return;
         }
         const std::string utf8 = ToUtf8(text);
@@ -2706,7 +2691,7 @@ private:
         CloseHandle(h);
 
         AddLog(3, L"Отчёт сохранён: " + FileName(path));
-        Notify(L"Отчёт сохранён: " + FileName(path), 3);
+        AddLog(3, L"Отчёт сохранён: " + FileName(path));
     }
 
     void ApplyDirectory() {
@@ -2719,7 +2704,7 @@ private:
             dir = DefaultReportDir();
             EnsureDir(dir);
             SetWindowTextW(view_.DirectoryEdit(), dir.c_str());
-            Notify(L"Не удалось создать каталог — выбран по умолчанию", 2);
+            AddLog(2, L"Не удалось создать каталог — выбран по умолчанию");
         }
         report_dir_ = dir;
     }
@@ -2745,7 +2730,7 @@ private:
         AddLog(0, L"=== ДИАГНОСТИКА ===");
         for (const std::wstring& line : DumpDiagnostics()) AddLog(0, line);
         AddLog(0, L"=== КОНЕЦ ДИАГНОСТИКИ ===");
-        Notify(L"Диагностика выведена в журнал и usb_log.txt", 0);
+        AddLog(0, L"Диагностика выведена в журнал и usb_log.txt");
 
         // Отдельный файл удобнее приложить к отчёту по лабораторной.
         ApplyDirectory();
@@ -2772,11 +2757,11 @@ private:
     // Перезапуск с правами администратора по команде из интерфейса.
     void RestartAsAdmin() {
         if (elevated_) {
-            Notify(L"Программа уже запущена от имени администратора", 0);
+            AddLog(0, L"Программа уже запущена от имени администратора");
             return;
         }
         if (!RelaunchElevated()) {
-            Notify(L"Повышение прав отменено", 1);
+            AddLog(1, L"Повышение прав отменено");
             return;
         }
         DestroyWindow(hwnd_);
@@ -2836,7 +2821,6 @@ private:
                                 : portable ? L"MTP-устройство (телефон/плеер)"
                                            : L"USB-устройство";
             AddLog(arrival ? 3 : 0, (arrival ? L"Подключено: " : L"Отключено: ") + what);
-            Notify(arrival ? L"Подключено: " + what : L"Отключено: " + what, arrival ? 3 : 0);
         }
         RequestAutoRefresh();
     }
@@ -2871,6 +2855,11 @@ private:
             case ID_OPEN_DIR: OpenDirectory(); break;
             case ID_ELEVATE:     RestartAsAdmin(); break;
             case ID_DIAGNOSTICS: ShowDiagnostics(); break;
+            case ID_LOG:
+                // Ctrl+L: перевести фокус в журнал и показать последние строки.
+                SetFocus(view_.DeviceLog());
+                view_.ScrollLogToEnd();
+                break;
             default: break;
         }
     }
@@ -2879,7 +2868,6 @@ private:
         if (cleaned_) return;
         cleaned_ = true;
 
-        KillTimer(hwnd_, TIMER_TOAST);
         KillTimer(hwnd_, TIMER_AUTO_REFRESH);
         if (accel_) {
             DestroyAcceleratorTable(accel_);
