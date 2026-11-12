@@ -1534,14 +1534,27 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
         result.last_error = GetLastError();
         result.message = L"Устройство не найдено";
         result.advice = {L"Обновите список клавишей F5."};
+        result.request_made = false;
         return result;
     }
     result.target_id = target_id;
 
     // Узел отключён (код 22) — его не извлекают, а включают обратно.
-    if (NodeProblem(target) == CM_PROB_DISABLED) {
+    // Проверяем оба узла цепочки: отключённым может оказаться как сам
+    // накопитель (USBSTOR), так и родительское USB-устройство.
+    DEVINST self_node = 0;
+    CM_Locate_DevNodeW(&self_node, const_cast<DEVINSTID_W>(disk.instance_id.c_str()),
+                       CM_LOCATE_DEVNODE_NORMAL);
+    std::wstring disabled_id;
+    if (self_node != 0 && NodeProblem(self_node) == CM_PROB_DISABLED) {
+        disabled_id = disk.instance_id;
+    } else if (NodeProblem(target) == CM_PROB_DISABLED) {
+        disabled_id = target_id;
+    }
+
+    if (!disabled_id.empty()) {
         DWORD error = 0;
-        if (elevated && ChangeDeviceState(target_id, DICS_ENABLE, error)) {
+        if (elevated && ChangeDeviceState(disabled_id, DICS_ENABLE, error)) {
             result.ok = true;
             result.message = L"Устройство было отключено — включено обратно";
             result.advice = {L"Обновите список (F5): накопитель должен появиться."};
@@ -1563,6 +1576,7 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
         result.veto = PNP_VetoNonDisableable;
         result.message = L"Отказ: накопитель содержит системный том";
         result.advice = {L"Диск, с которого загружена Windows, извлечь нельзя."};
+        result.request_made = false;
         return result;
     }
 
@@ -2211,8 +2225,8 @@ private:
 
         // Список пуст, но накопитель в системе есть — значит, его отбросил
         // фильтр перечисления. Подсказываем, где смотреть причину.
-        hidden_by_disable_ = disks_.empty() && AnyMassStoragePresent();
-        if (hidden_by_disable_ && !quiet) {
+        const bool storage_hidden = disks_.empty() && AnyMassStoragePresent();
+        if (storage_hidden && !quiet) {
             AddLog(1, L"Накопитель есть в системе, но не перечислен — нажмите");
             AddLog(1, L"  «Диагностика» (Ctrl+D): там все узлы и их состояние.");
         }
@@ -2792,7 +2806,6 @@ private:
     bool started_elevated_ = false;   // пришли как «--elevated»
     bool busy_ = false;
     bool scan_failed_ = false;
-    bool hidden_by_disable_ = false;   // накопитель есть, но не перечислен
     ULONGLONG auto_refresh_at_ = 0;       // время, когда можно обновлять список
     ULONGLONG device_event_until_ = 0;    // окно «тишины» для WM_DEVICECHANGE
 
