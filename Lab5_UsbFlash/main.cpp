@@ -2559,9 +2559,14 @@ private:
         // Если узел был отключён, запроса на извлечение не было — не пишем
         // про CM_Request_Device_Eject, чтобы журнал не вводил в заблуждение.
         if (result.request_made) {
-            AddLog(0, Format(L"  CM_Request_Device_Eject: %s", ConfigRetText(result.cr).c_str()));
-            AddLog(0, Format(L"  Veto: %s (GetLastError = %lu)", VetoText(result.veto).c_str(),
-                             result.last_error));
+            AddLog(result.ok ? 0 : 2,
+                   Format(L"  CM_Request_Device_Eject: %s", ConfigRetText(result.cr).c_str()));
+            // Veto имеет смысл только при отказе: при успехе система его не
+            // заполняет, и строка «причина не определена» только пугала.
+            if (!result.ok) {
+                AddLog(2, Format(L"  Veto: %s (GetLastError = %lu)",
+                                 VetoText(result.veto).c_str(), result.last_error));
+            }
         }
         for (const std::wstring& advice : result.advice) AddLog(0, L"  " + advice);
         if (!disk.eject_note.empty()) AddLog(0, L"  способ: " + disk.eject_note);
