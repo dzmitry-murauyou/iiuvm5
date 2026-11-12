@@ -267,6 +267,7 @@ struct EjectResult {
     // Диагностика: чем именно закончились этапы.
     DWORD last_error = 0;              // GetLastError после последнего вызова
     bool came_back = false;            // устройство исчезло (проверено повторно)
+    bool request_made = true;          // был ли сам запрос CM_Request_Device_Eject
 };
 
 // ===========================================================================
@@ -1279,9 +1280,18 @@ std::vector<wchar_t> PrepareVolumesForEject(const UsbDisk& disk,
         wchar_t volume_path[] = {L'\\', L'\\', L'?', L'\\', volume.letter, L':', 0};
 
         // 1. Сброс кэша файловой системы: гарантирует, что данные на носителе.
-        Handle volume_handle(CreateFileW(volume_path, GENERIC_READ | GENERIC_WRITE,
-                                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                                         0, nullptr));
+        //    Сначала пробуем чтение+запись; если носитель защищён от записи
+        //    (переключатель на SD-карте, read-only образ), драйвер вернёт
+        //    отказ на запись — тогда открываем только для чтения: сбросить
+        //    кэш и размонтировать том этого достаточно.
+        HANDLE raw = CreateFileW(volume_path, GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+                                 nullptr);
+        if (raw == INVALID_HANDLE_VALUE) {
+            raw = CreateFileW(volume_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, 0, nullptr);
+        }
+        Handle volume_handle(raw);
         if (!volume_handle) {
             notes.push_back(Format(L"Том %c: не открылся для сброса кэша (ошибка %lu)",
                                    volume.letter, GetLastError()));
@@ -1318,9 +1328,14 @@ std::vector<wchar_t> PrepareVolumesForEject(const UsbDisk& disk,
 void RemountVolumes(const std::vector<wchar_t>& letters) {
     for (wchar_t letter : letters) {
         wchar_t path[] = {L'\\', L'\\', L'?', L'\\', letter, L':', 0};
-        Handle volume(CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
-                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
-                                  nullptr));
+        HANDLE raw = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+                                 nullptr);
+        if (raw == INVALID_HANDLE_VALUE) {
+            raw = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_EXISTING, 0, nullptr);
+        }
+        Handle volume(raw);
         if (!volume) continue;
         DWORD returned = 0;
         DeviceIoControl(volume.get(), FSCTL_LOCK_VOLUME, nullptr, 0, nullptr, 0, &returned,
@@ -1509,7 +1524,8 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
             result.ok = true;
             result.message = L"Устройство было отключено — включено обратно";
             result.advice = {L"Обновите список (F5): накопитель должен появиться."};
-            disk.eject_note = L"DICS_ENABLE";
+            result.request_made = false;
+            disk.eject_note = L"DICS_ENABLE (извлечение не требовалось)";
             return result;
         }
         result.cr = CR_REMOVE_VETOED;
@@ -1517,6 +1533,7 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
         result.message = L"Устройство отключено в системе (код 22)";
         result.advice = {L"Запустите программу от имени администратора — она включит узел.",
                          L"Либо включите его в Диспетчере устройств."};
+        result.request_made = false;
         return result;
     }
 
@@ -2380,7 +2397,7 @@ private:
         AddLog(result.ok ? 3 : 2, result.message);
         // Если узел был отключён, запроса на извлечение не было — не пишем
         // про CM_Request_Device_Eject, чтобы журнал не вводил в заблуждение.
-        if (disk.eject_note != L"DICS_ENABLE") {
+        if (result.request_made) {
             AddLog(0, Format(L"  CM_Request_Device_Eject: %s", ConfigRetText(result.cr).c_str()));
             AddLog(0, Format(L"  Veto: %s (GetLastError = %lu)", VetoText(result.veto).c_str(),
                              result.last_error));
