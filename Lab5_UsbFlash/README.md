@@ -194,12 +194,17 @@ USB-накопители (SATA/NVMe-диски отбрасываются).
 ### 4.4. Безопасное извлечение
 
 ```cpp
-// 1. подготовка томов
-FlushFileBuffers(hVolume);                  // сброс кэшей ФС
-DeviceIoControl(hVolume, FSCTL_LOCK_VOLUME, ...);
-DeviceIoControl(hVolume, FSCTL_DISMOUNT_VOLUME, ...);
+// 0. привилегии: у администратора SeLoadDriver/SeUndock выключены в токене
+AdjustTokenPrivileges(hToken, SE_LOAD_DRIVER_NAME);   // и SE_UNDOCK_NAME
 
-// 2. запрос на извлечение
+// 1. подготовка томов
+FlushFileBuffers(hVolume);                            // сброс кэшей ФС
+DeviceIoControl(hVolume, FSCTL_LOCK_VOLUME, ...);     // до 5 попыток
+DeviceIoControl(hVolume, FSCTL_DISMOUNT_VOLUME, ...);
+DeviceIoControl(hVolume, IOCTL_STORAGE_MEDIA_REMOVAL, &noPrevent, ...);
+CloseHandle(hVolume);                                 // свой том не держим
+
+// 2. запрос на извлечение (до 3 попыток с паузой 250 мс)
 PNP_VETO_TYPE veto = PNP_VetoTypeUnknown;
 wchar_t vetoName[MAX_PATH] = {};
 CONFIGRET cr = CM_Request_Device_EjectW(node, &veto, vetoName,
