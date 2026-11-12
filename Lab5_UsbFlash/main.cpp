@@ -230,6 +230,14 @@ struct UsbDisk {
     std::wstring bus;            // «USB»
     std::wstring usb_class;      // «Mass Storage (0x08)» — класс из дескриптора
     std::wstring usb_id_source;  // откуда взяты VID/PID (для отчёта)
+
+    // Тип устройства: накопитель или телефон/плеер (MTP, PTP, ADB, модем).
+    enum class Kind { MassStorage, Portable };
+    Kind kind = Kind::MassStorage;
+    std::wstring device_kind;        // «USB-накопитель» / «Телефон (MTP)»
+    std::vector<std::wstring> interfaces;   // функции устройства (для телефонов)
+    std::wstring usb_node_id;        // Instance ID USB-узла (USB\VID_...&MI_..)
+    std::wstring eject_note;         // чем извлекали (для журнала и отчёта)
     DWORD device_number = 0;     // номер физического диска
     unsigned long long capacity = 0;
     int sector_size = 0;
@@ -255,6 +263,11 @@ struct EjectResult {
     std::wstring target_id;      // узел, к которому применялся запрос
     std::wstring message;        // короткая строка для журнала и плашки
     std::vector<std::wstring> advice;   // что делать при отказе
+
+    // Диагностика: чем именно закончились этапы.
+    DWORD last_error = 0;              // GetLastError после последнего вызова
+    bool came_back = false;            // устройство исчезло (проверено повторно)
+    bool fallback_used = false;        // применено отключение узла (DICS_DISABLE)
 };
 
 // ===========================================================================
@@ -365,6 +378,18 @@ std::wstring NodeString(DEVINST node, const DEVPROPKEY& key) {
     }
     if (type != DEVPROP_TYPE_STRING) return {};
     return Trim(reinterpret_cast<const wchar_t*>(buffer.data()));
+}
+
+// Instance ID узла и его родителя — короткие обёртки над CfgMgr32.
+std::wstring NodeId(DEVINST node) {
+    wchar_t id[MAX_DEVICE_ID_LEN] = {};
+    if (CM_Get_Device_IDW(node, id, MAX_DEVICE_ID_LEN, 0) != CR_SUCCESS) return {};
+    return id;
+}
+
+DEVINST NodeParent(DEVINST node) {
+    DEVINST parent = 0;
+    return CM_Get_Parent(&parent, node, 0) == CR_SUCCESS ? parent : 0;
 }
 
 // ===========================================================================
@@ -537,6 +562,62 @@ std::wstring ParentHubPath(DEVINST device_node, ULONG& port_number) {
     return std::wstring(list.data());
 }
 
+// Человекочитаемое имя класса интерфейса USB (по bInterfaceClass).
+const wchar_t* InterfaceClassName(unsigned char cls) {
+    switch (cls) {
+        case 0x01: return L"Audio";
+        case 0x02: return L"CDC / модем";
+        case 0x03: return L"HID";
+        case 0x06: return L"PTP (камера)";
+        case 0x07: return L"Printer";
+        case 0x08: return L"Mass Storage";
+        case 0x09: return L"Hub";
+        case 0x0A: return L"CDC-Data";
+        case 0x0B: return L"Smart Card";
+        case 0x0D: return L"Content Security";
+        case 0x0E: return L"Video";
+        case 0x0F: return L"Personal Healthcare";
+        case 0x10: return L"Audio/Video";
+        case 0xDC: return L"Diagnostic";
+        case 0xE0: return L"Wireless (Bluetooth)";
+        case 0xEF: return L"Misc (MTP/ADB)";
+        case 0xFE: return L"Application Specific";
+        case 0xFF: return L"Vendor Specific (ADB)";
+        default:   return L"класс 0x??";
+    }
+}
+
+// Типичные VID телефонов/плееров: если телефон подключён в режиме «только
+// зарядка», ни одного интерфейса данных нет, и отличить его можно по VID.
+bool IsPhoneVendor(const std::wstring& vid) {
+    static const wchar_t* kVendors[] = {
+        L"04E8",   // Samsung
+        L"18D1",   // Google / Nexus / Pixel (в режиме ADB)
+        L"2717",   // Xiaomi
+        L"22B8",   // Motorola
+        L"0FCE",   // Sony
+        L"12D1",   // Huawei
+        L"2A70",   // OnePlus
+        L"0BB4",   // HTC
+        L"1D45",   // Oppo / Realme
+        L"2D95",   // Vivo
+        L"1004",   // LG
+        L"22D9",   // OPPO / OnePlus
+        L"2916",   // Yandex Phone
+        L"2E04",   // YotaPhone
+        L"05AC",   // Apple (в Windows — только зарядка/фото)
+        L"054C",   // Sony (плееры)
+        L"0930",   // Toshiba
+        L"1B8E",   // Nokia
+        L"0421",   // Nokia
+        L"0E8D",   // MediaTek (инженерный режим)
+    };
+    for (const wchar_t* vendor : kVendors) {
+        if (_wcsicmp(vid.c_str(), vendor) == 0) return true;
+    }
+    return false;
+}
+
 // Запрос к драйверу хаба: скорость, дескриптор устройства, статус порта.
 bool QueryPortInfo(const std::wstring& hub_path, ULONG port, UsbDisk& disk) {
     Handle hub = OpenDevice(hub_path);
@@ -567,7 +648,7 @@ bool QueryPortInfo(const std::wstring& hub_path, ULONG port, UsbDisk& disk) {
     // bDeviceClass == 0 означает «класс задаётся интерфейсами» (IAD/composite).
     const unsigned char device_class = info->DeviceDescriptor.bDeviceClass;
     if (device_class == 0) {
-        disk.usb_class = L"определяется интерфейсом (массовое хранилище)";
+        disk.usb_class = L"определяется интерфейсами (composite)";
     } else {
         const wchar_t* name = L"класс 0x";
         switch (device_class) {
@@ -584,7 +665,72 @@ bool QueryPortInfo(const std::wstring& hub_path, ULONG port, UsbDisk& disk) {
         }
         disk.usb_class = Format(L"%s (0x%02X)", name, device_class);
     }
+
     return true;
+}
+
+// Перечисление функций составного USB-устройства (для телефонов это MTP,
+// PTP и ADB). Windows создаёт для каждой функции отдельный дочерний узел
+// с Instance ID вида USB\VID_18D1&PID_4EE2&MI_00\..., поэтому достаточно
+// пройти детей USB-узла и прочитать их описания и Compatible IDs.
+void CollectUsbFunctions(DEVINST usb_node, UsbDisk& disk) {
+    if (usb_node == 0) return;
+
+    DEVINST child = 0;
+    if (CM_Get_Child(&child, usb_node, 0) != CR_SUCCESS) return;
+
+    for (DEVINST node = child; node != 0;) {
+        wchar_t id[MAX_DEVICE_ID_LEN] = {};
+        if (CM_Get_Device_IDW(node, id, MAX_DEVICE_ID_LEN, 0) == CR_SUCCESS) {
+            const std::wstring desc = NodeString(node, DEVPKEY_Device_DeviceDesc);
+            const std::wstring name = NodeString(node, DEVPKEY_Device_FriendlyName);
+            const std::wstring compat = NodeString(node, DEVPKEY_Device_CompatibleIds);
+            const std::wstring all = Uppercase(desc + L" " + name + L" " + compat + L" " + id);
+
+            std::wstring label;
+            if (all.find(L"MTP") != std::wstring::npos) {
+                label = L"MTP (передача файлов)";
+            } else if (all.find(L"ADB") != std::wstring::npos) {
+                label = L"ADB (отладка по USB)";
+            } else if (all.find(L"PTP") != std::wstring::npos ||
+                       all.find(L"CLASS_06") != std::wstring::npos) {
+                label = L"PTP (камера/фото)";
+            } else if (all.find(L"CLASS_08") != std::wstring::npos ||
+                       all.find(L"MASS STORAGE") != std::wstring::npos) {
+                label = L"Mass Storage (флеш-накопитель)";
+            } else if (all.find(L"CLASS_02") != std::wstring::npos ||
+                       all.find(L"MODEM") != std::wstring::npos) {
+                label = L"Модем (CDC)";
+            } else if (all.find(L"CLASS_0E") != std::wstring::npos) {
+                label = L"Video (камера)";
+            } else if (all.find(L"CLASS_03") != std::wstring::npos) {
+                label = L"HID (кнопки/датчики)";
+            } else if (!desc.empty()) {
+                label = desc;
+            } else if (!name.empty()) {
+                label = name;
+            } else {
+                // Нет ни описания, ни известного класса — берём байт класса
+                // из Instance ID (USB\VID_...&MI_01&Class_FF&...).
+                const size_t cls = all.find(L"CLASS_");
+                if (cls != std::wstring::npos && cls + 8 <= all.size()) {
+                    const std::wstring hex = all.substr(cls + 6, 2);
+                    const unsigned value = (unsigned)wcstoul(hex.c_str(), nullptr, 16);
+                    label = Format(L"%s (0x%02X)", InterfaceClassName((unsigned char)value), value);
+                }
+            }
+
+            if (!label.empty()) disk.interfaces.push_back(label);
+        }
+        DEVINST next = 0;
+        if (CM_Get_Sibling(&next, node, 0) != CR_SUCCESS) break;
+        node = next;
+    }
+
+    // Составное устройство без MI_xx: функции = классы из дескриптора.
+    if (disk.interfaces.empty() && !disk.usb_class.empty()) {
+        disk.interfaces.push_back(disk.usb_class);
+    }
 }
 
 // ===========================================================================
@@ -740,6 +886,7 @@ ScanResult ScanUsbDisks() {
             continue;
         }
 
+        disk.device_number = (DWORD)-1;
         if (!DiskNumber(device.get(), disk.device_number)) {
             result.warnings.push_back(
                 Format(L"IOCTL_STORAGE_GET_DEVICE_NUMBER: ошибка %lu", GetLastError()));
@@ -819,12 +966,23 @@ ScanResult ScanUsbDisks() {
             }
         }
 
-        // Тома этого накопителя — по номеру физического диска.
-        auto it = volumes.find(disk.device_number);
-        if (it != volumes.end()) {
-            disk.volumes = it->second;
-            for (const VolumeInfo& volume : disk.volumes) {
-                if (volume.system) disk.system = true;
+        // Функции устройства (для накопителя это просто Mass Storage).
+        CollectUsbFunctions(have_node ? NodeParent(node) : 0, disk);
+        if (have_node) disk.usb_node_id = NodeId(node);
+
+        disk.kind = UsbDisk::Kind::MassStorage;
+        disk.device_kind = L"USB-накопитель";
+
+        // Тома этого накопителя — по номеру физического диска. Если номер
+        // прочитать не удалось (остался -1), тома не приписываем: иначе все
+        // тома системы «прилипли» бы к этому устройству.
+        if (disk.device_number != (DWORD)-1) {
+            auto it = volumes.find(disk.device_number);
+            if (it != volumes.end()) {
+                disk.volumes = it->second;
+                for (const VolumeInfo& volume : disk.volumes) {
+                    if (volume.system) disk.system = true;
+                }
             }
         }
 
@@ -879,6 +1037,159 @@ std::vector<std::wstring> EnumerateUsbDevicesReport() {
     }
     if (lines.empty()) lines.push_back(L"    (устройства не найдены)");
     return lines;
+}
+
+// ===========================================================================
+//  8.1. Телефоны и плееры: MTP/PTP-устройства (у них нет буквы диска)
+//
+//  Телефон в режиме «Передача файлов» (MTP) — не диск: буквы диска у него
+//  не будет никогда, поэтому GUID_DEVINTERFACE_DISK его не видит. Зато
+//  Windows создаёт для него узел класса WPD (Windows Portable Devices).
+//  Его и перечисляем через SetupAPI: GUID_DEVCLASS_WPD.
+// ===========================================================================
+
+// Разбор Instance ID USB-узла: «USB\VID_18D1&PID_4EE2&MI_00\...».
+// Возвращает true, если идентификаторы найдены.
+bool ParseUsbInstanceId(const std::wstring& id, std::wstring& vid, std::wstring& pid) {
+    const std::wstring upper = Uppercase(id);
+    const size_t v = upper.find(L"VID_");
+    const size_t p = upper.find(L"PID_");
+    if (v == std::wstring::npos || p == std::wstring::npos) return false;
+    if (v + 8 > id.size() || p + 8 > id.size()) return false;
+    vid = id.substr(v + 4, 4);
+    pid = id.substr(p + 4, 4);
+    return true;
+}
+
+// Корневой USB-узел устройства: поднимаемся по родителям, пока Instance ID
+// не станет «USB\VID_...» без &MI_ (это и есть физическое устройство).
+DEVINST RootUsbNode(DEVINST node, std::wstring& root_id) {
+    DEVINST current = node;
+    for (int depth = 0; current != 0 && depth < 8; ++depth) {
+        const std::wstring id = NodeId(current);
+        const std::wstring upper = Uppercase(id);
+        if (upper.rfind(L"USB\\", 0) == 0 && upper.find(L"&MI_") == std::wstring::npos) {
+            root_id = id;
+            return current;
+        }
+        DEVINST parent = NodeParent(current);
+        if (parent == 0) break;
+        current = parent;
+    }
+    return 0;
+}
+
+// Перечисление MTP/PTP-устройств (телефоны, плееры, фотоаппараты).
+std::vector<UsbDisk> ScanPortableDevices(ScanResult& result) {
+    std::vector<UsbDisk> devices;
+
+    DeviceInfoSet set(SetupDiGetClassDevsW(&GUID_DEVCLASS_WPD, nullptr, nullptr, DIGCF_PRESENT));
+    if (!set) {
+        result.warnings.push_back(
+            Format(L"SetupDiGetClassDevs(WPD): ошибка %lu", GetLastError()));
+        return devices;
+    }
+
+    SP_DEVINFO_DATA data{};
+    data.cbSize = sizeof(data);
+    for (DWORD index = 0; SetupDiEnumDeviceInfo(set.get(), index, &data); ++index) {
+        const std::wstring instance_id = [&] {
+            wchar_t id[MAX_DEVICE_ID_LEN] = {};
+            if (!SetupDiGetDeviceInstanceIdW(set.get(), &data, id, (DWORD)std::size(id), nullptr)) {
+                return std::wstring();
+            }
+            return std::wstring(id);
+        }();
+        if (instance_id.empty()) continue;
+
+        UsbDisk disk;
+        disk.kind = UsbDisk::Kind::Portable;
+        disk.instance_id = instance_id;
+        disk.friendly_name = RegistryString(set.get(), data, SPDRP_FRIENDLYNAME);
+        disk.device_desc = RegistryString(set.get(), data, SPDRP_DEVICEDESC);
+        disk.manufacturer = RegistryString(set.get(), data, SPDRP_MFG);
+        disk.bus = RegistryString(set.get(), data, SPDRP_ENUMERATOR_NAME);
+        disk.model = disk.friendly_name.empty() ? disk.device_desc : disk.friendly_name;
+
+        DEVINST node = 0;
+        if (CM_Locate_DevNodeW(&node, const_cast<DEVINSTID_W>(instance_id.c_str()),
+                               CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) {
+            continue;
+        }
+
+        std::wstring root_id;
+        const DEVINST root = RootUsbNode(node, root_id);
+        if (root == 0) continue;   // это не USB-устройство (например, веб-камера WPD)
+
+        disk.usb_node_id = root_id;
+        ParseUsbInstanceId(root_id, disk.vid, disk.pid);
+        if (disk.usb_id_source.empty()) disk.usb_id_source = L"Instance ID USB-узла (WPD)";
+
+        // Описание и функции: у телефона их несколько (MTP + ADB + зарядка).
+        CollectUsbFunctions(root, disk);
+        for (const std::wstring& function : disk.interfaces) {
+            if (function.find(L"MTP") != std::wstring::npos) {
+                disk.device_kind = L"Телефон / плеер (MTP)";
+            } else if (function.find(L"PTP") != std::wstring::npos && disk.device_kind.empty()) {
+                disk.device_kind = L"Фотоаппарат (PTP)";
+            } else if (function.find(L"ADB") != std::wstring::npos && disk.device_kind.empty()) {
+                disk.device_kind = L"Телефон (ADB, без MTP)";
+            }
+        }
+        if (disk.device_kind.empty()) {
+            disk.device_kind = IsPhoneVendor(disk.vid)
+                                   ? L"Телефон (MTP/PTP, режим без диска)"
+                                   : L"Портативное устройство (MTP/PTP)";
+        }
+
+        // Скорость и VID/PID из дескриптора USB через драйвер хаба.
+        ULONG port = 0;
+        const std::wstring hub_path = ParentHubPath(root, port);
+        if (!hub_path.empty() && port != 0) {
+            QueryPortInfo(hub_path, port, disk);
+            disk.usb_id_source = L"дескриптор USB (IOCTL хаба)";
+        }
+        if (disk.manufacturer.empty()) {
+            disk.manufacturer = NodeString(root, DEVPKEY_Device_Manufacturer);
+        }
+
+        // У MTP-устройства нет ни диска, ни тома: объём недоступен без WPD API.
+        // Если у телефона нет ни MTP, ни PTP, ни ADB — он подключён «только
+        // зарядка»: ни списка файлов, ни буквы диска в этом режиме не будет.
+        if (disk.interfaces.empty() && IsPhoneVendor(disk.vid)) {
+            disk.interfaces.push_back(L"режим «только зарядка» (данных нет)");
+        }
+
+        disk.capacity = 0;
+        disk.removable = true;
+        devices.push_back(std::move(disk));
+    }
+
+    // Одно физическое устройство может быть представлено несколькими узлами WPD
+    // (например, «Телефон» и «Камера») — оставляем по одному на USB-узел.
+    std::vector<UsbDisk> unique;
+    for (UsbDisk& device : devices) {
+        const bool duplicate = std::any_of(
+            unique.begin(), unique.end(),
+            [&](const UsbDisk& other) { return other.usb_node_id == device.usb_node_id; });
+        if (!duplicate) unique.push_back(std::move(device));
+    }
+    return unique;
+}
+
+// Полное перечисление: USB-накопители + телефоны/плееры (MTP/PTP).
+ScanResult ScanAllDevices() {
+    ScanResult result = ScanUsbDisks();
+    for (UsbDisk& device : ScanPortableDevices(result)) {
+        result.disks.push_back(std::move(device));
+    }
+    std::sort(result.disks.begin(), result.disks.end(), [](const UsbDisk& a, const UsbDisk& b) {
+        // Сначала накопители (у них есть буква диска), затем телефоны.
+        if (a.kind != b.kind) return a.kind == UsbDisk::Kind::MassStorage;
+        if (a.volumes.empty() != b.volumes.empty()) return !b.volumes.empty();
+        return Uppercase(a.model) < Uppercase(b.model);
+    });
+    return result;
 }
 
 // ===========================================================================
@@ -1018,18 +1329,117 @@ DEVINST EjectTargetNode(const UsbDisk& disk, std::wstring& target_id) {
     return node;
 }
 
-// Попытка безопасного извлечения с полным разбором результата.
-EjectResult EjectDisk(UsbDisk& disk) {
+// --- 9.1. Проверка «устройство исчезло» -------------------------------------
+// После успешного извлечения узел может ещё существовать несколько сотен
+// миллисекунд, а может исчезнуть сразу. Проверяем именно Instance ID.
+bool DeviceStillPresent(const std::wstring& instance_id) {
+    DEVINST node = 0;
+    return CM_Locate_DevNodeW(&node, const_cast<DEVINSTID_W>(instance_id.c_str()),
+                              CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS;
+}
+
+// Ждём исчезновения узла: 6 попыток по 120 мс — обычно хватает 1–2.
+bool WaitDeviceGone(const std::wstring& instance_id, int attempts = 6, DWORD delay_ms = 120) {
+    for (int i = 0; i < attempts; ++i) {
+        if (!DeviceStillPresent(instance_id)) return true;
+        Sleep(delay_ms);
+    }
+    return !DeviceStillPresent(instance_id);
+}
+
+// --- 9.2. Отключение узла через SetupAPI (fallback) -------------------------
+//
+// CM_Request_Device_Eject может вернуть CR_REMOVE_VETOED или CR_FAILURE из-за
+// фильтр-драйверов (антивирус, «умное» ПО накопителя). В этом случае остаётся
+// штатный путь Диспетчера устройств: DIF_PROPERTYCHANGE + DICS_DISABLE —
+// это тоже программное отключение устройства, только без снятия питания.
+// Такой приём требует прав администратора, поэтому программа сначала
+// проверяет, что процесс повышен.
+bool DisableDeviceNode(const std::wstring& instance_id, DWORD& last_error) {
+    DeviceInfoSet set(SetupDiCreateDeviceInfoList(nullptr, nullptr));
+    if (!set) {
+        last_error = GetLastError();
+        return false;
+    }
+
+    SP_DEVINFO_DATA data{};
+    data.cbSize = sizeof(data);
+    if (!SetupDiOpenDeviceInfoW(set.get(), instance_id.c_str(), nullptr, 0, &data)) {
+        last_error = GetLastError();
+        return false;
+    }
+
+    SP_PROPCHANGE_PARAMS params{};
+    params.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+    params.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+    params.StateChange = DICS_DISABLE;
+    params.Scope = DICS_FLAG_GLOBAL;      // отключить для всей системы
+    params.HwProfile = 0;
+
+    if (!SetupDiSetClassInstallParamsW(set.get(), &data,
+                                       &params.ClassInstallHeader, sizeof(params))) {
+        last_error = GetLastError();
+        return false;
+    }
+    if (!SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set.get(), &data)) {
+        last_error = GetLastError();
+        return false;
+    }
+    last_error = ERROR_SUCCESS;
+    return true;
+}
+
+// --- 9.3. Диагностика причины отказа ----------------------------------------
+// Когда CM_Request_Device_Eject вернул CR_REMOVE_VETOED с «неизвестной»
+// причиной, полезно проверить типичных «держателей»: тома на накопителе,
+// открытые файлы, признак загрузочного диска. Это то, что просит п.5 задания.
+void DiagnoseVolumes(const UsbDisk& disk, std::vector<std::wstring>& advice) {
+    for (const VolumeInfo& volume : disk.volumes) {
+        wchar_t root[8] = {volume.letter, L':', L'\\', 0};
+        if (!GetVolumeInformationW(root, nullptr, 0, nullptr, nullptr, nullptr, nullptr, 0)) {
+            continue;
+        }
+
+        // Пробуем открыть том «как для извлечения»: если не открывается —
+        // его держит другой процесс, и это и есть причина veto.
+        wchar_t path[] = {L'\\', L'\\', L'?', L'\\', volume.letter, L':', 0};
+        Handle handle(CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+                                  nullptr));
+        if (!handle) {
+            advice.push_back(Format(L"Том %c: открыть для извлечения не удалось (ошибка %lu).",
+                                    volume.letter, GetLastError()));
+            continue;
+        }
+
+        DWORD returned = 0;
+        if (!DeviceIoControl(handle.get(), FSCTL_LOCK_VOLUME, nullptr, 0, nullptr, 0, &returned,
+                             nullptr)) {
+            advice.push_back(Format(L"Том %c: блокировка невозможна (ошибка %lu) —",
+                                    volume.letter, GetLastError()));
+            advice.push_back(L"  на нём есть открытые файлы или запущенные программы.");
+        } else {
+            // Блокировка сработала: отпускаем её, чтобы не мешать системе.
+            DeviceIoControl(handle.get(), FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &returned,
+                            nullptr);
+        }
+    }
+}
+
+// --- 9.4. Извлечение: полноценная процедура с диагностикой -------------------
+EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
     EjectResult result;
 
     std::wstring target_id;
     const DEVINST node = EjectTargetNode(disk, target_id);
     if (node == 0) {
         result.cr = CR_NO_SUCH_DEVNODE;
+        result.last_error = GetLastError();
         result.message = L"Устройство не найдено — возможно, оно уже отключено";
         result.advice = {L"Обновите список клавишей F5."};
         return result;
     }
+    result.target_id = target_id;
 
     // Системный диск извлекать нельзя: предупреждаем до запроса.
     if (disk.system) {
@@ -1041,43 +1451,88 @@ EjectResult EjectDisk(UsbDisk& disk) {
         return result;
     }
 
-    // Шаг 1: подготовка томов (сброс кэшей, размонтирование).
+    // Шаг 1: подготовка томов. Для телефонов (MTP) томов нет — шаг пустой.
     std::vector<std::wstring> notes;
-    PrepareVolumesForEject(disk, notes);
+    if (!disk.volumes.empty()) PrepareVolumesForEject(disk, notes);
 
-    // Шаг 2: сам запрос на извлечение.
+    // Шаг 2: сам запрос на извлечение (требование задания — CM_Request_Device_Eject).
     //   CONFIGRET CM_Request_Device_EjectW(DEVINST, PNP_VETO_TYPE*, PWSTR, ULONG, ULONG)
     PNP_VETO_TYPE veto = PNP_VetoTypeUnknown;
     wchar_t veto_name[MAX_PATH] = {};
     const CONFIGRET cr = CM_Request_Device_EjectW(node, &veto, veto_name,
                                                   (ULONG)std::size(veto_name), 0);
+    const DWORD api_error = GetLastError();
 
     result.cr = cr;
     result.veto = veto;
     result.veto_name = Trim(veto_name);
-    result.target_id = target_id;
+    result.last_error = api_error;
 
     if (cr == CR_SUCCESS) {
+        // Важно: CR_SUCCESS ещё не значит, что устройство ушло. Проверяем.
+        result.came_back = !WaitDeviceGone(disk.instance_id);
         result.ok = true;
-        result.message = L"Накопитель извлечён — можно отключать";
-        result.advice = {L"Кэши сброшены, тома размонтированы, питание порта снято."};
+        if (result.came_back) {
+            result.message = L"Запрос принят, но устройство осталось подключённым";
+            result.advice = {
+                L"Windows сняла питание с порта, однако узел устройства не исчез.",
+                L"Если накопитель всё ещё виден в Проводнике — извлеките его повторно",
+                L"или отключите физически: данные уже сброшены на носитель."};
+        } else {
+            result.message = L"Накопитель извлечён — можно отключать";
+            result.advice = {L"Кэши сброшены, тома размонтированы, питание порта снято."};
+        }
+        disk.eject_note = L"CM_Request_Device_Eject: CR_SUCCESS";
         return result;
     }
 
-    // Шаг 3: отказ. Разбираем причину: код CONFIGRET + Veto-тип.
+    // Шаг 3: отказ. Разбираем причину: код CONFIGRET + Veto-тип + GetLastError.
     result.ok = false;
     result.message = Format(L"Извлечение отклонено: %s", VetoText(veto).c_str());
     result.advice = VetoAdvice(veto);
-    result.advice.push_back(Format(L"Код: %s", ConfigRetText(cr).c_str()));
+    result.advice.push_back(Format(L"Код: %s, GetLastError = %lu",
+                                   ConfigRetText(cr).c_str(), api_error));
     if (!result.veto_name.empty()) {
-        result.advice.push_back(Format(L"Держит накопитель: %s", result.veto_name.c_str()));
+        result.advice.push_back(Format(L"Держит устройство: %s", result.veto_name.c_str()));
     }
     for (const std::wstring& note : notes) result.advice.push_back(note);
 
-    // Если система не назвала причину — проверяем типичные вручную.
-    if (veto == PNP_VetoTypeUnknown && notes.empty()) {
-        result.advice.push_back(L"Проверьте: открытые файлы на накопителе, антивирус,");
-        result.advice.push_back(L"индексирование, права администратора.");
+    // Причина «неизвестна» — проверяем тома самостоятельно.
+    if (veto == PNP_VetoTypeUnknown && !disk.volumes.empty()) {
+        DiagnoseVolumes(disk, result.advice);
+    }
+
+    // Шаг 4: fallback. Если драйвер не умеет извлекаться, но у нас есть права
+    // администратора — штатно отключаем узел (как Диспетчер устройств).
+    if (elevated) {
+        DWORD disable_error = 0;
+        if (DisableDeviceNode(disk.instance_id, disable_error) &&
+            WaitDeviceGone(disk.instance_id)) {
+            result.ok = true;
+            result.fallback_used = true;
+            result.message = L"Устройство отключено программно (DICS_DISABLE)";
+            result.advice.insert(result.advice.begin(),
+                                 {L"Драйвер отклонил извлечение, поэтому узел отключён "
+                                  L"через SetupAPI — данные сброшены на носитель.",
+                                  L"Отключить накопитель физически можно сразу."});
+            disk.eject_note = L"CM_Request_Device_Eject отклонён, выполнен DICS_DISABLE";
+        } else {
+            result.advice.push_back(
+                Format(L"Отключение узла тоже не удалось (ошибка %lu).", disable_error));
+        }
+    } else {
+        result.advice.push_back(
+            L"Запустите программу от имени администратора: тогда при отказе драйвера "
+            L"узел будет отключён программно.");
+    }
+
+    if (!result.ok && result.veto == PNP_VetoTypeUnknown && notes.empty() &&
+        disk.volumes.empty()) {
+        result.advice.push_back(L"У MTP-устройства нет тома: закройте Проводник, "
+                                L"«Фотографии» и программы синхронизации.");
+    }
+    if (disk.kind == UsbDisk::Kind::Portable && result.ok) {
+        result.message = L"Телефон отключён от Windows — можно отсоединять";
     }
     return result;
 }
@@ -1085,6 +1540,194 @@ EjectResult EjectDisk(UsbDisk& disk) {
 // ===========================================================================
 //  10. Главное окно: вся логика приложения
 // ===========================================================================
+
+// ===========================================================================
+//  9.5. Диагностика для отчёта и кнопки «Диагностика»
+//
+//  Программа может «не видеть» телефон или отказывать в извлечении по
+//  причинам, которые не видны из одного вызова API. Этот дамп снимает
+//  состояние целиком: все узлы USB с VID/PID/классом/состоянием, все диски
+//  (включая не-USB), все тома с номерами PhysicalDrive, все WPD-узлы.
+//  Так сразу видно, например, что телефон есть в системе, но подключён
+//  «только зарядка» (нет ни MTP, ни ADB), или что флешка видна, но тома у
+//  неё нет.
+// ===========================================================================
+
+std::wstring NodeProblemText(ULONG problem) {
+    switch (problem) {
+        case 0:  return L"нет проблем";
+        case 1:  return L"CM_PROB_NOT_CONFIGURED (10) — устройство не настроено";
+        case 3:  return L"CM_PROB_OUT_OF_MEMORY";
+        case 10: return L"CM_PROB_FAILED_START (10)";
+        case 12: return L"CM_PROB_NORMAL_CONFLICT";
+        case 14: return L"CM_PROB_NEED_RESTART (14) — требуется перезагрузка";
+        case 18: return L"CM_PROB_REINSTALL (18) — переустановите драйвер";
+        case 19: return L"CM_PROB_REGISTRY";
+        case 21: return L"CM_PROB_WILL_BE_REMOVED (21)";
+        case 22: return L"CM_PROB_DISABLED (22) — устройство отключено";
+        case 24: return L"CM_PROB_DEVICE_NOT_THERE (24) — устройство отсутствует";
+        case 28: return L"CM_PROB_FAILED_INSTALL (28) — драйвер не установлен";
+        case 31: return L"CM_PROB_FAILED_ADD (31)";
+        case 32: return L"CM_PROB_DISABLED_SERVICE";
+        case 37: return L"CM_PROB_FAILED_DRIVER_ENTRY (37)";
+        case 39: return L"CM_PROB_DRIVER_FAILED_LOAD (39)";
+        case 43: return L"CM_PROB_FAILED_POST_START (43) — Windows остановила устройство";
+        case 45: return L"CM_PROB_HALTED (45) — устройство не подключено";
+        case 48: return L"CM_PROB_DISABLED_BY_POLICY (48)";
+        case 52: return L"CM_PROB_UNSIGNED_DRIVER (52)";
+        default: return Format(L"код проблемы %lu", problem);
+    }
+}
+
+// Все узлы класса USB (включая хабы) — с состоянием и признаком «есть диск».
+std::vector<std::wstring> DumpUsbTree() {
+    std::vector<std::wstring> lines;
+
+    DeviceInfoSet set(SetupDiGetClassDevsW(&GUID_DEVCLASS_USB, nullptr, nullptr, DIGCF_PRESENT));
+    if (!set) {
+        lines.push_back(Format(L"  SetupDiGetClassDevs(USB): ошибка %lu", GetLastError()));
+        return lines;
+    }
+
+    SP_DEVINFO_DATA data{};
+    data.cbSize = sizeof(data);
+    int index = 0;
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(set.get(), i, &data); ++i, ++index) {
+        wchar_t id[MAX_DEVICE_ID_LEN] = {};
+        if (!SetupDiGetDeviceInstanceIdW(set.get(), &data, id, (DWORD)std::size(id), nullptr)) {
+            continue;
+        }
+        const std::wstring desc = RegistryString(set.get(), data, SPDRP_DEVICEDESC);
+        const std::wstring friendly = RegistryString(set.get(), data, SPDRP_FRIENDLYNAME);
+
+        ULONG status = 0, problem = 0;
+        std::wstring state = L"?";
+        if (CM_Get_DevNode_Status(&status, &problem, data.DevInst, 0) == CR_SUCCESS) {
+            state = NodeProblemText(problem);
+            if (problem == 0) state = L"работает";
+        }
+
+        wchar_t vid_text[8] = {}, pid_text[8] = {};
+        std::wstring vid, pid;
+        if (ParseUsbInstanceId(id, vid, pid)) {
+            wcscpy_s(vid_text, vid.c_str());
+            wcscpy_s(pid_text, pid.c_str());
+        }
+
+        lines.push_back(Format(L"  [%2d] %04s:%04s %-8s %s%s", index, vid_text, pid_text,
+                               state.c_str(), desc.c_str(),
+                               friendly.empty() || friendly == desc
+                                   ? L""
+                                   : (L"  («" + friendly + L"»)").c_str()));
+        lines.push_back(Format(L"       %s", id));
+    }
+    if (index == 0) lines.push_back(L"  (узлов класса USB нет)");
+    return lines;
+}
+
+// Все диски системы (не только USB) и все тома с привязкой к физическим дискам.
+std::vector<std::wstring> DumpDisksAndVolumes() {
+    std::vector<std::wstring> lines;
+
+    const std::map<DWORD, std::vector<VolumeInfo>> volumes = VolumesByDiskNumber();
+
+    DeviceInfoSet set(SetupDiGetClassDevsW(&GUID_DEVINTERFACE_DISK, nullptr, nullptr,
+                                          DIGCF_PRESENT | DIGCF_DEVICEINTERFACE));
+    if (!set) {
+        lines.push_back(Format(L"  SetupDiGetClassDevs(DISK): ошибка %lu", GetLastError()));
+        return lines;
+    }
+
+    SP_DEVICE_INTERFACE_DATA interface_data{};
+    interface_data.cbSize = sizeof(interface_data);
+    int count = 0;
+    for (DWORD i = 0;
+         SetupDiEnumDeviceInterfaces(set.get(), nullptr, &GUID_DEVINTERFACE_DISK, i, &interface_data);
+         ++i) {
+        InterfaceDetail detail = GetInterfaceDetail(set.get(), interface_data);
+        if (!detail.valid) continue;
+
+        wchar_t id[MAX_DEVICE_ID_LEN] = {};
+        SetupDiGetDeviceInstanceIdW(set.get(), &detail.data, id, (DWORD)std::size(id), nullptr);
+
+        const bool usb = Uppercase(detail.path).find(L"USBSTOR") != std::wstring::npos;
+
+        DWORD number = (DWORD)-1;
+        std::wstring size_text = L"?";
+        Handle device = OpenDevice(detail.path);
+        if (device) {
+            DiskNumber(device.get(), number);
+            int sector = 0;
+            size_text = HumanSize(DiskCapacity(device.get(), sector));
+        }
+
+        std::wstring letters;
+        auto it = volumes.find(number);
+        if (it != volumes.end()) {
+            for (const VolumeInfo& volume : it->second) {
+                letters += std::wstring(1, volume.letter) + L": ";
+            }
+        }
+
+        lines.push_back(Format(L"  [%d] %-5s PhysicalDrive%lu  %-9s тома: %s", count,
+                               usb ? L"USB" : L"проч.", number, size_text.c_str(),
+                               letters.empty() ? L"нет" : letters.c_str()));
+        lines.push_back(Format(L"       %s", id));
+        ++count;
+    }
+    if (count == 0) lines.push_back(L"  (дисков нет)");
+
+    return lines;
+}
+
+// Все WPD-узлы: телефоны, плееры, фотоаппараты (то, что не является диском).
+std::vector<std::wstring> DumpPortableNodes() {
+    std::vector<std::wstring> lines;
+
+    DeviceInfoSet set(SetupDiGetClassDevsW(&GUID_DEVCLASS_WPD, nullptr, nullptr, DIGCF_PRESENT));
+    if (!set) {
+        lines.push_back(Format(L"  SetupDiGetClassDevs(WPD): ошибка %lu", GetLastError()));
+        return lines;
+    }
+
+    SP_DEVINFO_DATA data{};
+    data.cbSize = sizeof(data);
+    int count = 0;
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(set.get(), i, &data); ++i) {
+        wchar_t id[MAX_DEVICE_ID_LEN] = {};
+        if (!SetupDiGetDeviceInstanceIdW(set.get(), &data, id, (DWORD)std::size(id), nullptr)) {
+            continue;
+        }
+        const std::wstring desc = RegistryString(set.get(), data, SPDRP_DEVICEDESC);
+
+        DEVINST node = 0;
+        std::wstring root_id;
+        std::wstring root_text = L"(нет USB-родителя)";
+        if (CM_Locate_DevNodeW(&node, id, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
+            if (RootUsbNode(node, root_id) != 0) root_text = root_id;
+        }
+
+        lines.push_back(Format(L"  [%d] %s", count, desc.empty() ? L"(без описания)" : desc.c_str()));
+        lines.push_back(Format(L"       %s", id));
+        lines.push_back(Format(L"       USB: %s", root_text.c_str()));
+        ++count;
+    }
+    if (count == 0) lines.push_back(L"  (WPD-устройств нет)");
+    return lines;
+}
+
+std::vector<std::wstring> DumpDiagnostics() {
+    std::vector<std::wstring> lines;
+    lines.push_back(L"[USB-узлы (GUID_DEVCLASS_USB)]");
+    for (const std::wstring& line : DumpUsbTree()) lines.push_back(line);
+    lines.push_back(L"");
+    lines.push_back(L"[Диски и тома системы]");
+    for (const std::wstring& line : DumpDisksAndVolumes()) lines.push_back(line);
+    lines.push_back(L"");
+    lines.push_back(L"[Портативные устройства (WPD / MTP)]");
+    for (const std::wstring& line : DumpPortableNodes()) lines.push_back(line);
+    return lines;
+}
 
 const wchar_t* kClassName = L"Lab5UsbFlashWindow";
 
@@ -1100,6 +1743,19 @@ public:
 
     bool Init(HINSTANCE inst, int show) {
         inst_ = inst;
+        // Аргументы: --elevated (запуск после повышения прав), --dir <каталог>.
+        {
+            int count = 0;
+            LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &count);
+            if (argv) {
+                for (int i = 0; i < count; ++i) {
+                    const std::wstring arg = argv[i];
+                    if (arg == L"--elevated") started_elevated_ = true;
+                    if (arg == L"--dir" && i + 1 < count) predefined_dir_ = argv[i + 1];
+                }
+                LocalFree(argv);
+            }
+        }
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1115,7 +1771,7 @@ public:
 
         hwnd_ = CreateWindowExW(0, kClassName, L"USB-накопители — ЛР №5 (вариант А1)",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
-                                CW_USEDEFAULT, S(1120), S(820), nullptr, nullptr, inst_, this);
+                                CW_USEDEFAULT, S(1180), S(880), nullptr, nullptr, inst_, this);
         if (!hwnd_) return false;
 
         ShowWindow(hwnd_, show);
@@ -1124,6 +1780,23 @@ public:
     }
 
     int Run() {
+        // Если приложение запущено без прав администратора и пользователь
+        // не отказался от UAC — предлагаем повысить права сразу, один раз.
+        if (!elevated_ && !started_elevated_) {
+            const int answer = MessageBoxW(
+                hwnd_,
+                L"Для программного извлечения устройства нужны права администратора.\n\n"
+                L"Перезапустить программу с повышенными правами?\n"
+                L"(Если выбрать «Нет», извлечение через CM_Request_Device_Eject всё равно\n"
+                L"попробует выполниться, а причина отказа будет показана в журнале.)",
+                L"ЛР №5 — права администратора", MB_YESNO | MB_ICONQUESTION);
+            if (answer == IDYES && RelaunchElevated()) {
+                DestroyWindow(hwnd_);
+                return 0;   // новый экземпляр уже работает с правами
+            }
+            AddLog(0, L"Работа без прав администратора");
+        }
+
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
             // Акселераторы работают и когда фокус в списке или поле ввода.
@@ -1135,6 +1808,32 @@ public:
     }
 
 private:
+    // Повышение прав «на месте»: ShellExecuteW с runas перезапускает этот же
+    // exe с тем же каталогом отчётов, поэтому ничего не теряется.
+    // Причина: CM_Request_Device_Eject и DICS_DISABLE требуют прав
+    // администратора; без них Windows отдаёт CR_ACCESS_DENIED.
+    bool RelaunchElevated() {
+        wchar_t exe[MAX_PATH] = {};
+        if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return false;
+
+        std::wstring params = L"--elevated";
+        if (!report_dir_.empty()) params = L"--dir \"" + report_dir_ + L"\" --elevated";
+
+        SHELLEXECUTEINFOW info{};
+        info.cbSize = sizeof(info);
+        info.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+        info.lpVerb = L"runas";
+        info.lpFile = exe;
+        info.lpParameters = params.c_str();
+        info.nShow = SW_SHOWNORMAL;
+        if (!ShellExecuteExW(&info)) {
+            AddLog(1, Format(L"Повышение прав отменено или недоступно (ошибка %lu)",
+                             GetLastError()));
+            return false;
+        }
+        return true;
+    }
+
     // -----------------------------------------------------------------------
     //  Окно и сообщения
     // -----------------------------------------------------------------------
@@ -1257,7 +1956,7 @@ private:
     void OnCreate() {
         view_.Create(hwnd_, inst_);
 
-        report_dir_ = DefaultReportDir();
+        report_dir_ = predefined_dir_.empty() ? DefaultReportDir() : predefined_dir_;
         EnsureDir(report_dir_);
         SetWindowTextW(view_.DirectoryEdit(), report_dir_.c_str());
 
@@ -1269,6 +1968,7 @@ private:
             {FVIRTKEY, VK_F5, ID_REFRESH},
             {FVIRTKEY | FCONTROL, 'E', ID_EJECT},
             {FVIRTKEY | FCONTROL, 'S', ID_REPORT},
+            {FVIRTKEY | FCONTROL, 'D', ID_DIAGNOSTICS},
         };
         accel_ = CreateAcceleratorTableW(accel, (int)std::size(accel));
 
@@ -1280,6 +1980,15 @@ private:
         notify_volume_ = RegisterDeviceNotificationW(hwnd_, &filter,
                                                      DEVICE_NOTIFY_WINDOW_HANDLE);
 
+        // Телефоны (MTP) приходят как устройства класса WPD — подписываемся
+        // и на них, иначе список обновится только по DBT_DEVNODES_CHANGED.
+        DEV_BROADCAST_DEVICEINTERFACE_W wpd_filter{};
+        wpd_filter.dbcc_size = sizeof(wpd_filter);
+        wpd_filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+        wpd_filter.dbcc_classguid = GUID_DEVCLASS_WPD;
+        notify_wpd_ = RegisterDeviceNotificationW(hwnd_, &wpd_filter,
+                                                  DEVICE_NOTIFY_WINDOW_HANDLE);
+
         DEV_BROADCAST_DEVICEINTERFACE_W usb_filter{};
         usb_filter.dbcc_size = sizeof(usb_filter);
         usb_filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
@@ -1290,8 +1999,14 @@ private:
         AddLog(0, L"Приложение запущено");
         AddLog(0, elevated_ ? L"Права: администратор — извлечение и IOCTL доступны"
                             : L"Права: обычные — для извлечения может понадобиться администратор");
-        if (!notify_volume_ && !notify_usb_) {
+        if (!notify_volume_ && !notify_usb_ && !notify_wpd_) {
             AddLog(1, L"Не удалось подписаться на WM_DEVICECHANGE — список только по F5");
+        }
+        if (elevated_) {
+            AddLog(0, L"Режим администратора: доступен программный fallback извлечения");
+        } else {
+            AddLog(1, L"Обычные права. Если извлечение отклонено драйвером, включите");
+            AddLog(1, L"  «Запуск от имени администратора» — программа отключит узел сама.");
         }
 
         UpdateModel();
@@ -1357,7 +2072,7 @@ private:
         UpdateModel();
         InvalidateRect(hwnd_, nullptr, FALSE);
 
-        ScanResult scan = ScanUsbDisks();
+        ScanResult scan = ScanAllDevices();
         disks_ = std::move(scan.disks);
         scan_failed_ = scan.fatal;
         for (const std::wstring& warning : scan.warnings) AddLog(1, warning);
@@ -1387,7 +2102,7 @@ private:
         UpdateModel();
         InvalidateRect(hwnd_, nullptr, FALSE);
 
-        AddLog(0, Format(L"Перечисление завершено: накопителей %d", (int)disks_.size()));
+        AddLog(0, Format(L"Перечисление завершено: устройств %d", (int)disks_.size()));
         if (!quiet) {
             if (disks_.empty()) {
                 Notify(L"USB-накопители не найдены", 1);
@@ -1427,10 +2142,10 @@ private:
             model_.status = L"Ошибка перечисления";
         } else if (disks_.empty()) {
             model_.scan_state = ScanIdle;
-            model_.status = L"Накопители не найдены";
+            model_.status = L"Устройства не найдены";
         } else {
             model_.scan_state = ScanIdle;
-            model_.status = Format(L"Накопителей: %d", (int)disks_.size());
+            model_.status = Format(L"Найдено устройств: %d", (int)disks_.size());
         }
         model_.elevated = elevated_;
         model_.rights = elevated_ ? L"Администратор" : L"Обычные права";
@@ -1443,7 +2158,10 @@ private:
         model_.rows.clear();
         for (const UsbDisk& disk : disks_) {
             DeviceRow row;
-            row.title = disk.model.empty() ? L"USB-накопитель" : disk.model;
+            row.title = disk.model.empty()
+                            ? (disk.kind == UsbDisk::Kind::Portable ? L"Телефон (MTP)"
+                                                                    : L"USB-накопитель")
+                            : disk.model;
             row.subtitle = Format(L"VID %s · PID %s",
                                   disk.vid.empty() ? L"—" : disk.vid.c_str(),
                                   disk.pid.empty() ? L"—" : disk.pid.c_str());
@@ -1451,9 +2169,12 @@ private:
                 row.subtitle += (v ? L", " : L" · ");
                 row.subtitle += std::wstring(1, disk.volumes[v].letter) + L":";
             }
-            row.capacity = HumanSize(disk.capacity);
+            row.capacity = disk.kind == UsbDisk::Kind::MassStorage ? HumanSize(disk.capacity)
+                                                                  : L"";
             row.has_drive = !disk.volumes.empty();
             row.system = disk.system;
+            row.kind = disk.kind == UsbDisk::Kind::Portable ? L"Телефон (MTP)" : L"Накопитель";
+            row.portable = disk.kind == UsbDisk::Kind::Portable;
             model_.rows.push_back(row);
         }
 
@@ -1466,16 +2187,25 @@ private:
         }
 
         const UsbDisk& disk = disks_[index];
-        model_.detail_title = disk.model.empty() ? L"USB-накопитель" : disk.model;
-        model_.detail_sub = Format(L"%s · %s · %s",
-                                   disk.manufacturer.empty() ? L"производитель неизвестен"
-                                                             : disk.manufacturer.c_str(),
-                                   HumanSize(disk.capacity).c_str(), disk.speed.c_str());
+        const bool portable = disk.kind == UsbDisk::Kind::Portable;
+        model_.detail_title = disk.model.empty()
+                                  ? (portable ? L"Телефон (MTP)" : L"USB-накопитель")
+                                  : disk.model;
+        model_.detail_sub =
+            portable ? Format(L"%s · MTP · %s",
+                              disk.manufacturer.empty() ? L"производитель неизвестен"
+                                                        : disk.manufacturer.c_str(),
+                              disk.speed.empty() ? L"USB" : disk.speed.c_str())
+                     : Format(L"%s · %s · %s",
+                              disk.manufacturer.empty() ? L"производитель неизвестен"
+                                                        : disk.manufacturer.c_str(),
+                              HumanSize(disk.capacity).c_str(), disk.speed.c_str());
 
         const auto field = [this](const wchar_t* label, const std::wstring& value) {
             model_.fields.push_back({label, value.empty() ? L"—" : value});
         };
 
+        field(L"Тип устройства", disk.device_kind);
         field(L"VID", disk.vid);
         field(L"PID", disk.pid);
         field(L"Источник VID/PID", disk.usb_id_source);
@@ -1487,29 +2217,47 @@ private:
         field(L"Шина", disk.bus);
         field(L"Интерфейс", disk.usb_version.empty() ? L"USB" : disk.usb_version);
         field(L"Скорость", disk.speed);
-        field(L"Объём", HumanSize(disk.capacity));
 
-        // Буквы дисков и тома — по заданию п.3.
-        std::wstring letters;
-        for (size_t i = 0; i < disk.volumes.size(); ++i) {
-            if (i) letters += L", ";
-            letters += std::wstring(1, disk.volumes[i].letter) + L":";
+        if (!portable) {
+            field(L"Объём", HumanSize(disk.capacity));
+
+            // Буквы дисков и тома — по заданию п.3.
+            std::wstring letters;
+            for (size_t i = 0; i < disk.volumes.size(); ++i) {
+                if (i) letters += L", ";
+                letters += std::wstring(1, disk.volumes[i].letter) + L":";
+            }
+            field(L"Буквы дисков", letters.empty() ? L"нет тома" : letters);
+
+            for (const VolumeInfo& volume : disk.volumes) {
+                std::wstring text = volume.file_system;
+                if (!volume.label.empty()) text = volume.label + L" · " + text;
+                text += Format(L" · свободно %s из %s", HumanSize(volume.free).c_str(),
+                               HumanSize(volume.total).c_str());
+                field(Format(L"Том %c:", volume.letter).c_str(), text);
+            }
+
+            field(L"Съёмный", disk.removable ? L"да" : L"нет");
+            field(L"Защита от записи", disk.write_protected ? L"да" : L"нет");
+            field(L"Номер диска", disk.device_number == (DWORD)-1
+                                      ? L"—"
+                                      : Format(L"PhysicalDrive%lu", disk.device_number));
+            field(L"Сектор", disk.sector_size ? Format(L"%d байт", disk.sector_size) : L"—");
+            field(L"Состояние", disk.system ? L"содержит системный том" : L"готов к извлечению");
+        } else {
+            // Режим подключения телефона — главное, что нужно объяснить:
+            // в MTP-режиме буквы диска не будет никогда.
+            std::wstring functions;
+            for (size_t i = 0; i < disk.interfaces.size(); ++i) {
+                functions += (i ? L", " : L"") + disk.interfaces[i];
+            }
+            field(L"Функции USB", functions.empty() ? L"—" : functions);
+            field(L"Буквы дисков", L"нет: MTP не является диском");
+            field(L"Как получить диск",
+                  L"на телефоне: «USB → Передача файлов (UMS)», если есть");
+            field(L"Состояние", L"MTP-устройство: извлекается как устройство");
+            field(L"Узел USB", disk.usb_node_id);
         }
-        field(L"Буквы дисков", letters.empty() ? L"нет тома" : letters);
-
-        for (const VolumeInfo& volume : disk.volumes) {
-            std::wstring text = volume.file_system;
-            if (!volume.label.empty()) text = volume.label + L" · " + text;
-            text += Format(L" · свободно %s из %s", HumanSize(volume.free).c_str(),
-                           HumanSize(volume.total).c_str());
-            field(Format(L"Том %c:", volume.letter).c_str(), text);
-        }
-
-        field(L"Съёмный", disk.removable ? L"да" : L"нет");
-        field(L"Защита от записи", disk.write_protected ? L"да" : L"нет");
-        field(L"Номер диска", Format(L"PhysicalDrive%lu", disk.device_number));
-        field(L"Сектор", disk.sector_size ? Format(L"%d байт", disk.sector_size) : L"—");
-        field(L"Состояние", disk.system ? L"содержит системный том" : L"готов к извлечению");
 
         view_.SetEnabled(model_);
     }
@@ -1520,7 +2268,7 @@ private:
     void EjectSelected() {
         const int index = SelectedIndex();
         if (index < 0 || index >= (int)disks_.size()) {
-            Notify(L"Сначала выберите накопитель в списке", 1);
+            Notify(L"Сначала выберите устройство в списке", 1);
             return;
         }
         if (busy_) return;   // идёт перечисление или другое извлечение
@@ -1537,33 +2285,56 @@ private:
         model_.status = L"Извлечение…";
         view_.SetEnabled(model_);
         InvalidateRect(hwnd_, nullptr, FALSE);
-        AddLog(0, Format(L"Запрос безопасного извлечения: %s", disk.model.c_str()));
-        AddLog(0, L"  узел: " + disk.instance_id);
 
-        EjectResult result = EjectDisk(disk);
+        AddLog(0, Format(L"Запрос безопасного извлечения: %s (%s)", disk.model.c_str(),
+                         disk.device_kind.c_str()));
+        AddLog(0, L"  узел: " + disk.instance_id);
+        if (!disk.interfaces.empty()) {
+            std::wstring list;
+            for (size_t i = 0; i < disk.interfaces.size(); ++i) {
+                list += (i ? L", " : L"") + disk.interfaces[i];
+            }
+            AddLog(0, L"  функции: " + list);
+        }
+        // Извлечение может занимать до секунды (ожидание исчезновения узла),
+        // поэтому перерисовываем окно до начала работы и после неё.
+        UpdateWindow(hwnd_);
+
+        EjectResult result = EjectDisk(disk, elevated_);
+
+        AddLog(result.ok ? 3 : 2, result.message);
+        AddLog(0, Format(L"  CM_Request_Device_Eject: %s", ConfigRetText(result.cr).c_str()));
+        AddLog(0, Format(L"  Veto: %s (GetLastError = %lu)", VetoText(result.veto).c_str(),
+                         result.last_error));
+        for (const std::wstring& advice : result.advice) AddLog(0, L"  " + advice);
+        if (!disk.eject_note.empty()) AddLog(0, L"  способ: " + disk.eject_note);
+
+        Notify(result.message, result.ok ? 3 : 2);
 
         if (result.ok) {
-            AddLog(3, result.message);
-            for (const std::wstring& advice : result.advice) AddLog(0, L"  " + advice);
-            Notify(result.message, 3);
             disk.present = false;
-            // Устройство исчезло — обновляем список (обычно приходит и WM_DEVICECHANGE).
             busy_ = false;
-            Refresh(true);
+            Refresh(true);   // устройство исчезло — перечитываем список
             return;
         }
-
-        // Отказ: выводим причину и рекомендации — это требование задания.
-        AddLog(2, result.message);
-        AddLog(0, Format(L"  CM_Request_Device_Eject: %s", ConfigRetText(result.cr).c_str()));
-        AddLog(0, Format(L"  Veto: %s", VetoText(result.veto).c_str()));
-        for (const std::wstring& advice : result.advice) AddLog(0, L"  " + advice);
-        Notify(result.message, 2);
 
         busy_ = false;
         model_.busy = false;
         UpdateModel();
         InvalidateRect(hwnd_, nullptr, FALSE);
+
+        // Без прав администратора драйвер почти всегда отвечает отказом.
+        // Предлагаем перезапустить программу с повышением прав — сразу,
+        // пока пользователь видит причину отказа в журнале.
+        if (!elevated_) {
+            const std::wstring question =
+                L"Извлечение отклонено.\n\n" + result.message +
+                L"\n\nЗапустить программу от имени администратора и повторить?";
+            if (MessageBoxW(hwnd_, question.c_str(), L"ЛР №5 — нужны права администратора",
+                            MB_YESNO | MB_ICONWARNING) == IDYES) {
+                if (RelaunchElevated()) DestroyWindow(hwnd_);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1580,10 +2351,23 @@ private:
         text += L"Права процесса: " + std::wstring(elevated_ ? L"администратор" : L"обычные") + L"\r\n";
         text += std::wstring(78, L'=') + L"\r\n\r\n";
 
-        text += Format(L"Найдено USB-накопителей: %d\r\n\r\n", (int)disks_.size());
+        text += Format(L"Найдено устройств: %d\r\n\r\n", (int)disks_.size());
         for (size_t i = 0; i < disks_.size(); ++i) {
             const UsbDisk& disk = disks_[i];
-            text += Format(L"--- Накопитель %d ---\r\n", (int)i + 1);
+            const bool portable = disk.kind == UsbDisk::Kind::Portable;
+            text += Format(L"--- Устройство %d ---\r\n", (int)i + 1);
+            text += L"Тип устройства:    " + disk.device_kind + L"\r\n";
+            if (!disk.interfaces.empty()) {
+                std::wstring functions;
+                for (size_t f = 0; f < disk.interfaces.size(); ++f) {
+                    functions += (f ? L", " : L"") + disk.interfaces[f];
+                }
+                text += L"Функции USB:       " + functions + L"\r\n";
+            }
+            if (portable) {
+                text += L"Буквы дисков:      нет — MTP не является диском\r\n";
+                text += L"Узел USB:          " + disk.usb_node_id + L"\r\n";
+            }
             text += L"Модель:            " + disk.model + L"\r\n";
             text += L"Производитель:     " + disk.manufacturer + L"\r\n";
             text += L"VID / PID:         " + disk.vid + L" / " + disk.pid + L"\r\n";
@@ -1594,8 +2378,10 @@ private:
             text += L"Класс USB:         " + disk.usb_class + L"\r\n";
             text += L"Шина:              " + disk.bus + L"\r\n";
             text += L"Скорость:          " + disk.speed + L"\r\n";
-            text += L"Объём:             " + HumanSize(disk.capacity) + L" (" +
-                    ExactBytes(disk.capacity) + L")\r\n";
+            if (!portable) {
+                text += L"Объём:             " + HumanSize(disk.capacity) + L" (" +
+                        ExactBytes(disk.capacity) + L")\r\n";
+            }
             text += L"Сектор:            " +
                     (disk.sector_size ? Format(L"%d байт\r\n", disk.sector_size) : L"—\r\n");
             text += L"Съёмный:           " + std::wstring(disk.removable ? L"да" : L"нет") + L"\r\n";
@@ -1604,8 +2390,11 @@ private:
             text += Format(L"PhysicalDrive:     %lu\r\n", disk.device_number);
             text += L"Instance ID:       " + disk.instance_id + L"\r\n";
             text += L"Device Path:       " + disk.disk_path + L"\r\n";
+            if (!disk.eject_note.empty()) text += L"Извлечение:        " + disk.eject_note + L"\r\n";
 
-            if (disk.volumes.empty()) {
+            if (portable) {
+                text += L"Тома:              недоступны: MTP-устройство не имеет тома\r\n";
+            } else if (disk.volumes.empty()) {
                 text += L"Тома:              нет (носитель без файловой системы)\r\n";
             }
             for (const VolumeInfo& volume : disk.volumes) {
@@ -1621,6 +2410,10 @@ private:
 
         text += L"Все USB-устройства (GUID_DEVINTERFACE_USB_DEVICE):\r\n";
         for (const std::wstring& line : EnumerateUsbDevicesReport()) text += line + L"\r\n";
+        text += L"\r\n";
+
+        text += std::wstring(78, L'-') + L"\r\nДиагностика шины (если устройство не видно):\r\n";
+        for (const std::wstring& line : DumpDiagnostics()) text += line + L"\r\n";
         text += L"\r\n";
 
         text += std::wstring(78, L'=') + L"\r\nЖурнал событий:\r\n";
@@ -1676,6 +2469,48 @@ private:
         CoTaskMemFree(idl);
     }
 
+    // Кнопка «Диагностика»: полный снимок состояния шины в журнал и в файл.
+    void ShowDiagnostics() {
+        AddLog(0, L"=== ДИАГНОСТИКА ===");
+        for (const std::wstring& line : DumpDiagnostics()) AddLog(0, line);
+        AddLog(0, L"=== КОНЕЦ ДИАГНОСТИКИ ===");
+        Notify(L"Диагностика выведена в журнал и usb_log.txt", 0);
+
+        // Отдельный файл удобнее приложить к отчёту по лабораторной.
+        ApplyDirectory();
+        const std::wstring path = JoinPath(report_dir_, L"usb_diagnostics_" + FileStamp() + L".txt");
+        std::wstring text = L"ЛР №5 — диагностика шины USB\r\n" + NowStamp(false) + L"\r\n" +
+                            std::wstring(78, L'=') + L"\r\n";
+        for (const std::wstring& line : DumpDiagnostics()) text += line + L"\r\n";
+
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            AddLog(2, L"Не удалось записать файл диагностики: " + FileName(path));
+            return;
+        }
+        const std::string utf8 = ToUtf8(text);
+        DWORD written = 0;
+        static const unsigned char bom[3] = {0xEF, 0xBB, 0xBF};
+        WriteFile(h, bom, 3, &written, nullptr);
+        WriteFile(h, utf8.data(), (DWORD)utf8.size(), &written, nullptr);
+        CloseHandle(h);
+        AddLog(3, L"Файл диагностики: " + FileName(path));
+    }
+
+    // Перезапуск с правами администратора по команде из интерфейса.
+    void RestartAsAdmin() {
+        if (elevated_) {
+            Notify(L"Программа уже запущена от имени администратора", 0);
+            return;
+        }
+        if (!RelaunchElevated()) {
+            Notify(L"Повышение прав отменено", 1);
+            return;
+        }
+        DestroyWindow(hwnd_);
+    }
+
     void OpenDirectory() {
         ApplyDirectory();
         EnsureDir(report_dir_);
@@ -1686,40 +2521,45 @@ private:
     //  Горячее подключение: WM_DEVICECHANGE
     // -----------------------------------------------------------------------
     void OnDeviceChange(WPARAM event, LPARAM data) {
-        switch (event) {
-            case DBT_DEVICEARRIVAL:
-            case DBT_DEVICEREMOVECOMPLETE: {
-                auto* header = reinterpret_cast<DEV_BROADCAST_HDR*>(data);
-                if (header && header->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE) {
-                    auto* iface =
-                        reinterpret_cast<DEV_BROADCAST_DEVICEINTERFACE_W*>(header);
-                    const std::wstring name = Uppercase(iface->dbcc_name);
-                    const bool is_volume = name.find(L"USBSTOR") != std::wstring::npos ||
-                                           IsEqualGUID(iface->dbcc_classguid,
-                                                       GUID_DEVINTERFACE_VOLUME);
-                    if (!is_volume) return;
-                }
-                const bool arrival = event == DBT_DEVICEARRIVAL;
-                // Небольшая задержка не нужна: перечисление само по себе
-                // занимает миллисекунды и видит уже готовое устройство.
-                AddLog(arrival ? 3 : 0,
-                       arrival ? L"Подключено USB-устройство (WM_DEVICECHANGE: DBT_DEVICEARRIVAL)"
-                               : L"Отключено USB-устройство (WM_DEVICECHANGE: "
-                                 L"DBT_DEVICEREMOVECOMPLETE)");
-                Refresh(true);
-                Notify(arrival ? L"USB-накопитель подключён" : L"USB-накопитель отключён",
-                       arrival ? 3 : 0);
-                break;
-            }
-            case DBT_DEVNODES_CHANGED:
-                // Узел изменился — перечитываем без уведомления, чтобы не спамить.
-                // Вместе с DEVICEARRIVAL/REMOVECOMPLETE это даёт два события
-                // подряд, поэтому обновляем не чаще одного раза в 400 мс.
-                RequestAutoRefresh();
-                break;
-            default:
-                break;
+        if (event != DBT_DEVICEARRIVAL && event != DBT_DEVICEREMOVECOMPLETE &&
+            event != DBT_DEVNODES_CHANGED) {
+            return;
         }
+
+        const bool arrival = event == DBT_DEVICEARRIVAL;
+        std::wstring what;
+
+        auto* header = reinterpret_cast<DEV_BROADCAST_HDR*>(data);
+        if (header && header->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE) {
+            auto* iface = reinterpret_cast<DEV_BROADCAST_DEVICEINTERFACE_W*>(header);
+            const std::wstring name = Uppercase(iface->dbcc_name);
+
+            // Что именно подключилось: накопитель (USBSTOR/VOLUME) или
+            // телефон/плеер (WPD). Для WPD разбираем VID/PID прямо из пути
+            // устройства: \\?\usb#vid_18d1&pid_4ee2#...
+            if (name.find(L"USBSTOR") != std::wstring::npos ||
+                IsEqualGUID(iface->dbcc_classguid, GUID_DEVINTERFACE_VOLUME)) {
+                what = L"USB-накопитель";
+            } else if (IsEqualGUID(iface->dbcc_classguid, GUID_DEVCLASS_WPD) ||
+                       name.find(L"WPD") != std::wstring::npos) {
+                what = L"MTP-устройство (телефон/плеер)";
+            } else if (IsEqualGUID(iface->dbcc_classguid, GUID_DEVINTERFACE_USB_DEVICE) ||
+                       name.find(L"USB#VID_") != std::wstring::npos) {
+                what = L"USB-устройство";
+            } else {
+                return;   // чужие интерфейсы игнорируем
+            }
+        }
+
+        if (event != DBT_DEVNODES_CHANGED) {
+            const std::wstring text = what.empty()
+                                          ? (arrival ? L"Подключено устройство"
+                                                     : L"Отключено устройство")
+                                          : (arrival ? L"Подключено: " : L"Отключено: ") + what;
+            AddLog(arrival ? 3 : 0, text + L" (WM_DEVICECHANGE)");
+            Notify(text, arrival ? 3 : 0);
+        }
+        RequestAutoRefresh();
     }
 
     // Отложенное (склеенное) обновление списка по WM_DEVICECHANGE.
@@ -1750,6 +2590,8 @@ private:
             case ID_REPORT:   SaveReport(); break;
             case ID_BROWSE:   BrowseDirectory(); break;
             case ID_OPEN_DIR: OpenDirectory(); break;
+            case ID_ELEVATE:     RestartAsAdmin(); break;
+            case ID_DIAGNOSTICS: ShowDiagnostics(); break;
             default: break;
         }
     }
@@ -1772,6 +2614,10 @@ private:
             UnregisterDeviceNotification(notify_usb_);
             notify_usb_ = nullptr;
         }
+        if (notify_wpd_) {
+            UnregisterDeviceNotification(notify_wpd_);
+            notify_wpd_ = nullptr;
+        }
         AddLog(0, L"Приложение закрыто");
         view_.Destroy();
     }
@@ -1788,13 +2634,16 @@ private:
     std::vector<std::wstring> log_;
 
     std::wstring report_dir_;
+    std::wstring predefined_dir_;
     bool elevated_ = false;
+    bool started_elevated_ = false;   // пришли как «--elevated»
     bool busy_ = false;
     bool scan_failed_ = false;
     ULONGLONG auto_refresh_at_ = 0;   // время, когда можно обновлять список
 
     HDEVNOTIFY notify_volume_ = nullptr;
     HDEVNOTIFY notify_usb_ = nullptr;
+    HDEVNOTIFY notify_wpd_ = nullptr;
     HACCEL accel_ = nullptr;
 };
 

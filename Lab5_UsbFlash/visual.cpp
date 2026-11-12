@@ -230,10 +230,13 @@ void View::CreateControls() {
                        LBS_NOTIFY | WS_TABSTOP,
                    ID_LIST);
     h_refresh_ = Make(L"BUTTON", L"Обновить", BS_OWNERDRAW | WS_TABSTOP, ID_REFRESH);
+    h_diag_ = Make(L"BUTTON", L"Диагностика", BS_OWNERDRAW | WS_TABSTOP, ID_DIAGNOSTICS);
     h_eject_ = Make(L"BUTTON", L"Безопасное извлечение", BS_OWNERDRAW | WS_TABSTOP, ID_EJECT);
     h_report_ = Make(L"BUTTON", L"Сохранить отчёт", BS_OWNERDRAW | WS_TABSTOP, ID_REPORT);
     h_browse_ = Make(L"BUTTON", L"Обзор…", BS_OWNERDRAW | WS_TABSTOP, ID_BROWSE);
     h_open_ = Make(L"BUTTON", L"Открыть папку", BS_OWNERDRAW | WS_TABSTOP, ID_OPEN_DIR);
+    h_elevate_ = Make(L"BUTTON", L"Запустить от администратора", BS_OWNERDRAW | WS_TABSTOP,
+                      ID_ELEVATE);
 
     h_dir_ = Make(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, ID_DIR);
     h_log_ = Make(L"LISTBOX", L"",
@@ -262,8 +265,9 @@ void View::AddLogLine(const std::wstring& line, int level) {
 }
 
 int View::MinWidth() const {
-    // карточка списка (380) + карточка устройства (PanelW) + отступы и поля
-    return S(theme::Pad * 2 + 380 + theme::Gap + theme::PanelW + 40);
+    // карточка списка (кнопки «Обновить»/«Диагностика»/«Обзор…» + счётчик)
+    // + карточка устройства (PanelW) + отступы и поля окна
+    return S(theme::Pad * 2 + 476 + theme::Gap + theme::PanelW + 40);
 }
 
 int View::MinHeight() const {
@@ -314,15 +318,24 @@ void View::Layout() {
         list_head_ = {list_rc_.left + p, list_rc_.top + S(10), list_rc_.right - p,
                       list_rc_.top + S(34)};
 
-        const int refresh_w = S(112);
-        const int browse_w = S(104);
+        // Кнопки в один ряд: [«Обновить»] [«Диагностика»] … [«Обзор…»]
+        const int refresh_w = S(104);
+        const int diag_w = S(116);
+        const int browse_w = S(96);
+        const int gap_btn = S(8);
         const int button_y = list_rc_.top + S(42);
         const int browse_x = list_rc_.right - p - browse_w;
-        const int count_right = browse_x - S(10) - refresh_w - S(10);
+        const int diag_x = browse_x - gap_btn - diag_w;
+        const int refresh_x = diag_x - gap_btn - refresh_w;
+        const int count_right = refresh_x - S(10);
         list_count_ = {list_rc_.left + p, button_y, count_right, button_y + S(28)};
 
-        SetWindowPos(h_refresh_, nullptr, count_right + S(10), button_y, refresh_w, S(28),
-                     SWP_NOZORDER);
+        // При узком окне кнопки сдвигаются влево, но не наезжают на счётчик.
+        SetWindowPos(h_refresh_, nullptr, std::max<int>(list_rc_.left + p, refresh_x), button_y,
+                     refresh_w, S(28), SWP_NOZORDER);
+        SetWindowPos(h_diag_, nullptr,
+                     std::max<int>(list_rc_.left + p + refresh_w + gap_btn, diag_x), button_y,
+                     diag_w, S(28), SWP_NOZORDER);
         SetWindowPos(h_browse_, nullptr, browse_x, button_y, browse_w, S(28), SWP_NOZORDER);
 
         list_body_ = {list_rc_.left + p, button_y + S(38), list_rc_.right - p,
@@ -380,9 +393,12 @@ void View::Layout() {
         SetWindowPos(h_report_, nullptr, left + half + gap2, y2,
                      (int)right - (left + half + gap2), S(32), SWP_NOZORDER);
 
-        // Ряд 3: открыть папку с отчётами.
+        // Ряд 3: открыть папку с отчётами и повышение прав.
         const int y3 = action_rc_.top + S(114);
-        SetWindowPos(h_open_, nullptr, left, y3, std::min(S(200), (int)(right - left)), S(26),
+        const int open_w = std::min(S(180), ((int)right - left - gap2) / 2);
+        SetWindowPos(h_open_, nullptr, left, y3, open_w, S(26), SWP_NOZORDER);
+        const int elev_x = left + open_w + gap2;
+        SetWindowPos(h_elevate_, nullptr, elev_x, y3, std::max(S(150), (int)right - elev_x), S(26),
                      SWP_NOZORDER);
     }
 
@@ -408,6 +424,7 @@ void View::SetEnabled(const Model& model) {
     ShowWindow(h_list_, model.rows.empty() ? SW_HIDE : SW_SHOW);
 
     EnableWindow(h_refresh_, (!busy && !model.busy) ? TRUE : FALSE);
+    EnableWindow(h_diag_, (!busy) ? TRUE : FALSE);
     EnableWindow(h_list_, (!busy && !model.busy) ? TRUE : FALSE);
     EnableWindow(h_eject_, can_eject ? TRUE : FALSE);
     EnableWindow(h_report_, (!busy && !model.busy) ? TRUE : FALSE);
@@ -415,9 +432,13 @@ void View::SetEnabled(const Model& model) {
     EnableWindow(h_browse_, TRUE);
     EnableWindow(h_open_, TRUE);
 
+    // Кнопка повышения прав нужна только когда прав нет.
+    ShowWindow(h_elevate_, model.elevated ? SW_HIDE : SW_SHOW);
+    EnableWindow(h_elevate_, model.elevated ? FALSE : TRUE);
+
     // Owner-draw кнопки не перерисовываются сами при смене состояния —
     // иначе «Извлечь» остаётся нарисованной в старом виде.
-    for (HWND button : {h_refresh_, h_eject_, h_report_, h_browse_, h_open_}) {
+    for (HWND button : {h_refresh_, h_diag_, h_eject_, h_report_, h_browse_, h_open_, h_elevate_}) {
         InvalidateRect(button, nullptr, FALSE);
     }
 }
@@ -496,6 +517,19 @@ void View::DrawDriveIcon(Graphics& g, int x, int y, const Color& accent) {
     g.FillRectangle(&slot_brush, slot);
 }
 
+// Значок телефона: скруглённый корпус и экран. Нужен, чтобы MTP-устройство
+// визуально отличалось от флешки — у него нет и не будет буквы диска.
+void View::DrawPhoneIcon(Graphics& g, int x, int y, const Color& accent) {
+    const int unit = S(10);
+    RECT body{x + unit / 2, y, x + unit * 3, y + unit * 2};
+    RoundedRect(g, body, Color(255, 28, 40, 60), accent, S(2));
+    RECT screen{x + unit, y + S(4), x + unit * 3 - S(4), y + unit * 2 - S(6)};
+    SolidBrush screen_brush(Color(255, 10, 16, 26));
+    g.FillRectangle(&screen_brush, (INT)screen.left, (INT)screen.top,
+                    (INT)(screen.right - screen.left), (INT)(screen.bottom - screen.top));
+    Dot(g, x + unit * 3 - S(6), y + unit * 2 - S(3), S(1), accent);
+}
+
 void View::DrawList(Graphics& g, const Model& model) {
     g.SetClip(RectF((REAL)list_rc_.left, (REAL)list_rc_.top,
                     (REAL)(list_rc_.right - list_rc_.left),
@@ -513,17 +547,17 @@ void View::DrawList(Graphics& g, const Model& model) {
         // Пустое состояние: значок, заголовок и подсказка по центру списка.
         const int cx = (list_body_.left + list_body_.right) / 2;
         const int cy = (list_body_.top + list_body_.bottom) / 2;
-        DrawDriveIcon(g, cx - S(20), cy - S(46), theme::Dim);
+        DrawDriveIcon(g, cx - S(20), cy - S(48), theme::Dim);
 
-        RECT head{list_body_.left, cy - S(18), list_body_.right, cy + S(8)};
-        TextG(g, model.scan_state == ScanBusy ? L"Опрос устройств…" : L"USB-накопитель не найден",
+        RECT head{list_body_.left, cy - S(20), list_body_.right, cy + S(6)};
+        TextG(g, model.scan_state == ScanBusy ? L"Опрос устройств…" : L"USB-устройства не найдены",
               head, f_section_, theme::Sub, StringAlignmentCenter);
 
-        RECT hint{list_body_.left, cy + S(10), list_body_.right, cy + S(34)};
+        RECT hint{list_body_.left, cy + S(8), list_body_.right, cy + S(30)};
         TextG(g,
               model.scan_state == ScanBusy
                   ? L"Идёт перечисление через SetupAPI"
-                  : L"Подключите флешку — список обновится автоматически",
+                  : L"Флешка подключается сразу, телефон — после выбора «Передача файлов»",
               hint, f_label_, theme::Dim, StringAlignmentCenter);
     }
 
@@ -600,8 +634,8 @@ void View::DrawLogCard(Graphics& g) {
 
     // Горячие клавиши — справа в заголовке карточки.
     RECT keys{log_head_.left, log_head_.top, log_head_.right, log_head_.bottom};
-    TextG(g, L"F5 — обновить · Ctrl+E — извлечь · Ctrl+S — отчёт", keys, f_label_, theme::Dim,
-          StringAlignmentFar);
+    TextG(g, L"F5 — обновить · Ctrl+E — извлечь · Ctrl+S — отчёт · Ctrl+D — диагностика", keys,
+          f_label_, theme::Dim, StringAlignmentFar);
 
     g.ResetClip();
 }
@@ -702,6 +736,15 @@ void View::DrawButton(const DRAWITEMSTRUCT* item) {
         fill = pressed ? Color(255, 132, 44, 40) : Color(255, 106, 34, 32);
         border = Color(255, 214, 96, 88);
         text = Color(255, 255, 236, 234);
+    } else if (item->CtlID == ID_DIAGNOSTICS) {
+        fill = pressed ? Color(255, 48, 62, 90) : Color(255, 34, 46, 70);
+        border = Color(255, 108, 132, 172);
+        text = Color(255, 226, 236, 250);
+    } else if (item->CtlID == ID_ELEVATE) {
+        // Не опасная, но важная операция — синий акцент.
+        fill = pressed ? Color(255, 40, 74, 120) : Color(255, 30, 56, 92);
+        border = theme::Accent;
+        text = Color(255, 226, 238, 255);
     } else if (item->CtlID == ID_REFRESH) {
         fill = pressed ? Color(255, 30, 130, 90) : Color(255, 24, 110, 74);
         border = Color(255, 60, 200, 140);
@@ -747,9 +790,15 @@ void View::DrawDeviceItem(const DRAWITEMSTRUCT* item) {
                 selected ? theme::Accent : theme::Line, RadiusPx());
 
     const DeviceRow* row = RowForItem(item);
+    const bool portable = row && row->portable;
 
-    DrawDriveIcon(g, card.left + S(14), card.top + S(15),
-                  selected ? theme::Accent : theme::Sub);
+    if (portable) {
+        DrawPhoneIcon(g, card.left + S(12), card.top + S(15),
+                      selected ? theme::Accent : theme::Sub);
+    } else {
+        DrawDriveIcon(g, card.left + S(14), card.top + S(15),
+                      selected ? theme::Accent : theme::Sub);
+    }
 
     RECT title{card.left + S(60), card.top + S(8), card.right - S(96), card.top + S(32)};
     TextG(g, row && !row->title.empty() ? row->title : L"USB-накопитель", title, f_value_,
@@ -764,8 +813,21 @@ void View::DrawDeviceItem(const DRAWITEMSTRUCT* item) {
 
     const bool system = row && row->system;
     const bool has_drive = row && row->has_drive;
-    std::wstring tag = system ? L"системный" : (has_drive ? L"том смонтирован" : L"без тома");
-    const Color tag_color = system ? theme::Bad : (has_drive ? theme::Good : theme::Dim);
+    std::wstring tag;
+    Color tag_color = theme::Dim;
+    if (portable) {
+        tag = L"MTP";
+        tag_color = theme::Accent;
+    } else if (system) {
+        tag = L"системный";
+        tag_color = theme::Bad;
+    } else if (has_drive) {
+        tag = L"том смонтирован";
+        tag_color = theme::Good;
+    } else {
+        tag = L"без тома";
+        tag_color = theme::Dim;
+    }
     RECT tag_rc{card.right - S(130), card.top + S(31), card.right - S(14), card.top + S(52)};
     const int tag_w = TextWidth(g, tag, f_log_);
     Dot(g, tag_rc.right - tag_w - S(8), (tag_rc.top + tag_rc.bottom) / 2, S(4), tag_color);

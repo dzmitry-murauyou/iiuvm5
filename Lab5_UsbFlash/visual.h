@@ -39,6 +39,8 @@ enum : int {
     ID_DIR,              // поле каталога отчётов
     ID_BROWSE,           // «Обзор…»
     ID_OPEN_DIR,         // «Открыть папку»
+    ID_ELEVATE,          // «Запустить от администратора»
+    ID_DIAGNOSTICS,      // «Диагностика» (Ctrl+D)
     ID_LOG,              // журнал событий
 };
 
@@ -52,8 +54,10 @@ struct Field {
 struct DeviceRow {
     std::wstring title;      // модель или «USB-накопитель»
     std::wstring subtitle;   // «VID_xxxx · PID_xxxx · 2 тома»
-    std::wstring capacity;   // «28,9 ГБ»
+    std::wstring capacity;   // «28,9 ГБ» (для телефонов — пусто)
+    std::wstring kind;       // «Накопитель» / «Телефон (MTP)»
     bool has_drive = false;  // есть ли буквы дисков
+    bool portable = false;   // MTP/PTP — тома нет по определению
     bool system = false;     // системный/загрузочный — извлекать нельзя
 };
 
@@ -124,6 +128,7 @@ private:
     void DrawPill(Gdiplus::Graphics& g, const RECT& rc, const std::wstring& text,
                   const Gdiplus::Color& dot);
     void DrawDriveIcon(Gdiplus::Graphics& g, int x, int y, const Gdiplus::Color& accent);
+    void DrawPhoneIcon(Gdiplus::Graphics& g, int x, int y, const Gdiplus::Color& accent);
 
     void DrawList(Gdiplus::Graphics& g, const Model& model);
     void DrawPanel(Gdiplus::Graphics& g, const Model& model);
@@ -142,6 +147,8 @@ private:
 
     HWND h_list_ = nullptr, h_refresh_ = nullptr, h_eject_ = nullptr;
     HWND h_report_ = nullptr, h_browse_ = nullptr, h_open_ = nullptr;
+    HWND h_elevate_ = nullptr;
+    HWND h_diag_ = nullptr;
     HWND h_dir_ = nullptr, h_log_ = nullptr;
     HBRUSH field_brush_ = nullptr;
 
