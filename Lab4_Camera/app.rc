@@ -1,0 +1,33 @@
+// ---------------------------------------------------------------------------
+//  app.rc -- ресурсы: значок окна/трея и сведения о файле.
+// ---------------------------------------------------------------------------
+#include <windows.h>
+
+101 ICON "app.ico"
+
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION     1,0,0,0
+    PRODUCTVERSION  1,0,0,0
+    FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+    FILEFLAGS       0x0L
+    FILEOS          VOS_NT_WINDOWS32
+    FILETYPE        VFT_APP
+    FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription",  "Photo monitoring (Lab 4)"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "Lab4_Camera"
+            VALUE "OriginalFilename", "Lab4_Camera.exe"
+            VALUE "ProductName",      "Lab4_Camera"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
