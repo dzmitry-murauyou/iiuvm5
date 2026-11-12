@@ -1275,10 +1275,10 @@ std::vector<std::wstring> VetoAdvice(PNP_VETO_TYPE veto) {
 // заблокировать том (FSCTL_LOCK_VOLUME), размонтирование (FSCTL_DISMOUNT_VOLUME)
 // и снятие запрета на извлечение носителя (IOCTL_STORAGE_MEDIA_REMOVAL).
 //
-// Дескрипторы остаются открытыми до конца запроса на извлечение: блокировка
-// тома живёт, пока открыт дескриптор, и закрытие раньше времени возвращает
-// том в строй — тогда кто угодно снова его откроет, а запрос получит
-// CR_REMOVE_VETOED.
+// Дескрипторы закрываются сразу после подготовки и до запроса на извлечение:
+// открытый нами том система считает незавершённым обращением к устройству и
+// отвечает CR_REMOVE_VETOED. Том к этому моменту уже размонтирован, так что
+// закрытие дескриптора его не «оживляет».
 //
 // Деструктор закрывает все handles: исключение или ранний выход не оставят
 // висящих дескрипторов.
@@ -1430,6 +1430,33 @@ DEVINST EjectTargetNode(const UsbDisk& disk, std::wstring& target_id) {
     }
     target_id = disk.instance_id;
     return node;
+}
+
+// Права процесса, которых требует CM_Request_Device_Eject.
+// Документация Microsoft: для устройства без CM_DEVCAP_DOCKDEVICE нужен
+// SeLoadDriverPrivilege, для док-станции — SeUndockPrivilege. У группы
+// «Администраторы» они есть в токене, но выключены: выключенная привилегия
+// не даёт доступа, и запрос отклоняется даже у администратора. Поэтому
+// включаем обе привилегии явно, один раз при запуске.
+bool EnablePrivilege(const wchar_t* name) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        return false;
+    }
+
+    LUID luid{};
+    bool ok = false;
+    if (LookupPrivilegeValueW(nullptr, name, &luid)) {
+        TOKEN_PRIVILEGES privileges{};
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = luid;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        ok = AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr,
+                                   nullptr) &&
+             GetLastError() == ERROR_SUCCESS;
+    }
+    CloseHandle(token);
+    return ok;
 }
 
 // --- 9.1. Запрос на извлечение ----------------------------------------------
@@ -1639,10 +1666,12 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
     }
 
     // 1. Подготовка томов: кэши и размонтирование (для MTP томов нет).
-    //    Тома остаются заблокированными до конца запроса: блокировка снимается
-    //    при закрытии дескриптора, и если закрыть его раньше, файловая система
-    //    успевает смонтировать том обратно, а извлечение отклоняется.
     EjectPrep prep = PrepareVolumesForEject(disk);
+    // Дескрипторы закрываем ДО запроса на извлечение: пока том открыт нашим
+    // процессом, система считает обращение к нему незавершённым и отклоняет
+    // извлечение с CR_REMOVE_VETOED. Том при этом уже размонтирован, поэтому
+    // закрытие дескриптора не «возвращает» его обратно.
+    prep.CloseAll();
 
     // 2. Запрос на извлечение.
     PNP_VETO_TYPE veto = PNP_VetoTypeUnknown;
@@ -1681,7 +1710,10 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
 
     bool gone = false;
     if (cr == CR_SUCCESS) {
-        gone = WaitDeviceGone(disk.instance_id);
+        // Ждём исчезновения узла, к которому обращались, и самого накопителя.
+        gone = WaitDeviceGone(disk.instance_id) ||
+               (!target_id.empty() && target_id != disk.instance_id &&
+                WaitDeviceGone(target_id));
         result.ok = gone;
         result.came_back = !gone;
         result.message = gone ? L"Накопитель извлечён — можно отключать"
@@ -1692,7 +1724,6 @@ EjectResult EjectDisk(UsbDisk& disk, bool elevated) {
                             : std::vector<std::wstring>{
                                   L"Данные на носителе сброшены — отключать можно и так."};
         disk.eject_note = L"CM_Request_Device_Eject: CR_SUCCESS";
-        prep.CloseAll();
         return result;
     }
 
@@ -2148,6 +2179,13 @@ private:
         // Права процесса: извлечение и часть IOCTL требуют администратора.
         elevated_ = IsElevated();
 
+        // Даже у администратора нужные привилегии выключены в токене.
+        // Включаем их сразу: иначе CM_Request_Device_Eject отвечает
+        // CR_ACCESS_DENIED / CR_REMOVE_VETOED несмотря на права.
+        const bool load_ok = EnablePrivilege(SE_LOAD_DRIVER_NAME);
+        const bool undock_ok = EnablePrivilege(SE_UNDOCK_NAME);
+        privileges_ready_ = load_ok || undock_ok;
+
         // Горячие клавиши: F5 — обновить, Ctrl+E — извлечь, Ctrl+S — отчёт.
         ACCEL accel[] = {
             {FVIRTKEY, VK_F5, ID_REFRESH},
@@ -2182,6 +2220,8 @@ private:
                                                   DEVICE_NOTIFY_WINDOW_HANDLE);
 
         AddLog(0, L"Приложение запущено");
+        AddLog(0, privileges_ready_ ? L"Привилегии SeLoadDriver/SeUndock включены"
+                                    : L"Привилегии SeLoadDriver/SeUndock недоступны");
         AddLog(0, elevated_ ? L"Права: администратор — извлечение и IOCTL доступны"
                             : L"Права: обычные — для извлечения может понадобиться администратор");
         if (!notify_volume_ && !notify_usb_ && !notify_wpd_) {
@@ -2867,6 +2907,7 @@ private:
     std::wstring predefined_dir_;
     bool elevated_ = false;
     bool started_elevated_ = false;   // пришли как «--elevated»
+    bool privileges_ready_ = false;   // SeLoadDriver/SeUndock включены в токене
     bool busy_ = false;
     bool scan_failed_ = false;
     ULONGLONG auto_refresh_at_ = 0;       // время, когда можно обновлять список
